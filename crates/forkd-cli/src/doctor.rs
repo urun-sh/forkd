@@ -83,6 +83,7 @@ impl Check {
 /// on stdout and the exit code becomes the gate: 0 = every FAIL-class
 /// check green, 1 = at least one blocking check red. A WARN never
 /// blocks (same as the human path).
+#[derive(Default)]
 pub(crate) struct DoctorOpts {
     /// Emit a single JSON object instead of the glyph report.
     pub json: bool,
@@ -101,18 +102,6 @@ pub(crate) struct DoctorOpts {
     /// Guest port to probe after the smoke spawn (e.g. 49983 for
     /// envd). TCP connect success = pass. None = skip the probe.
     pub smoke_port: Option<u16>,
-}
-
-impl Default for DoctorOpts {
-    fn default() -> Self {
-        Self {
-            json: false,
-            expected_fc_version: None,
-            min_netns: None,
-            smoke_tag: None,
-            smoke_port: None,
-        }
-    }
 }
 
 pub fn run_with(opts: DoctorOpts, daemon_url: &str, daemon_token: Option<String>) -> anyhow::Result<()> {
@@ -846,6 +835,11 @@ fn check_smoke_spawn(
         .or(parsed["id"].as_str())
         .unwrap_or("")
         .to_string();
+    let netns = parsed[0]["netns"]
+        .as_str()
+        .or(parsed["netns"].as_str())
+        .unwrap_or("")
+        .to_string();
     let guest_addr = parsed[0]["guest_addr"]
         .as_str()
         .or(parsed["guest_addr"].as_str())
@@ -867,32 +861,114 @@ fn check_smoke_spawn(
             .call();
         check
     };
-    // Optional guest-port probe (e.g. envd on 49983). The guest addr
-    // carries the agent port (:8888); swap in the probe port.
+    // Optional guest-port probe (e.g. envd on :49983). Per-child-netns
+    // sandboxes put the guest at 10.42.0.2 INSIDE the child's netns,
+    // so the probe must run via `ip netns exec <netns>` — from the
+    // root netns the address is unreachable. Children also come out
+    // of restore with a brief bind lag (socat/envd), so retry for a
+    // few seconds before failing (same contract as lane-02's
+    // init-loop.sh).
     if let Some(port) = smoke_port {
         let probe_addr = match guest_addr.rsplit_once(':') {
             Some((host, _)) => format!("{host}:{port}"),
             None => format!("10.42.0.2:{port}"),
         };
-        let addr: std::net::SocketAddr = probe_addr
-            .parse()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([10, 42, 0, 2], port)));
-        match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-            Ok(_) => delete(Check::pass(
-                name,
-                format!("spawned `{tag}` and {probe_addr} reachable"),
-            )),
-            Err(e) => delete(Check::fail(
-                name,
-                format!("spawned `{tag}` but {probe_addr} unreachable: {e}"),
-                "guest service did not come up; check the bake / envd start in the guest",
-            )),
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match probe_guest_port(&netns, &probe_addr) {
+                Ok(true) => {
+                    return delete(Check::pass(
+                        name,
+                        format!("spawned `{tag}` and {probe_addr} reachable"),
+                    ))
+                }
+                Ok(false) => {
+                    if std::time::Instant::now() >= deadline {
+                        return delete(Check::fail(
+                            name,
+                            format!("spawned `{tag}` but {probe_addr} unreachable after 10s of retries"),
+                            "guest service did not come up; check the bake / envd start in the guest",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return delete(Check::fail(
+                            name,
+                            format!("probe of {probe_addr} errored: {e}"),
+                            "ip netns exec failed — is doctor running as root?",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
         }
     } else {
         delete(Check::pass(
             name,
             format!("spawned `{tag}` (id {id}) and deleted"),
         ))
+    }
+}
+
+/// TCP-connect to `addr`, entering `netns` first when non-empty
+/// (per-child-netns guests live at 10.42.0.2 inside their own
+/// netns). Ok(true) = connected; Ok(false) = refused/unreachable
+/// (retryable); Err = the netns exec itself failed.
+#[cfg(target_os = "linux")]
+fn probe_guest_port(netns: &str, addr: &str) -> anyhow::Result<bool> {
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {addr}: {e}"))?;
+    if netns.is_empty() {
+        return match std::net::TcpStream::connect_timeout(&sockaddr, Duration::from_secs(3)) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        };
+    }
+    // setns() via a helper child: `ip netns exec` requires root, and
+    // doing it in-process would leave the doctor process in the
+    // child's netns for the rest of its run.
+    let status = Command::new("ip")
+        .args(["netns", "exec", netns])
+        .arg("true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => return Err(anyhow::anyhow!("cannot enter netns {netns} (need root)")),
+        Err(e) => return Err(anyhow::anyhow!("exec ip: {e}")),
+    }
+    let out = Command::new("ip")
+        .args(["netns", "exec", netns])
+        .arg("bash")
+        .arg("-c")
+        .arg(format!(
+            "exec 3<>/dev/tcp/{} && echo connected",
+            addr.replace(':', "/")
+        ))
+        .output();
+    match out {
+        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("connected") => {
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("exec ip netns bash: {e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_guest_port(netns: &str, addr: &str) -> anyhow::Result<bool> {
+    // No netns on non-Linux; plain connect is the best we can do.
+    let _ = netns;
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {addr}: {e}"))?;
+    match std::net::TcpStream::connect_timeout(&sockaddr, Duration::from_secs(3)) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
     }
 }
 

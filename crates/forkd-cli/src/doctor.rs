@@ -1325,9 +1325,9 @@ mod tests {
         // The readiness derivation print_json encodes: ready iff no
         // FAIL. A WARN (docker absent, ksm off) must never gate a
         // serving node red.
-        let warn_only = vec![Check::pass("a", "ok"), Check::warn("b", "meh")];
+        let warn_only = vec![Check::pass("a", "ok"), Check::warn("b", "meh", "h")];
         assert!(!warn_only.iter().any(|c| c.status == Status::Fail));
-        let failing = vec![Check::pass("a", "ok"), Check::fail("b", "bad")];
+        let failing = vec![Check::pass("a", "ok"), Check::fail("b", "bad", "h")];
         assert!(failing.iter().any(|c| c.status == Status::Fail));
     }
 

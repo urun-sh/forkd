@@ -556,6 +556,26 @@ enum Cmd {
         /// Bearer token for the controller daemon (matches `--token-file`).
         #[arg(long, env = "FORKD_TOKEN", hide_env_values = true)]
         daemon_token: Option<String>,
+        /// Emit one JSON object ({"ready":bool,"checks":[...]}) and use
+        /// the exit code as the gate. For readiness probes / CI.
+        #[arg(long)]
+        json: bool,
+        /// Pin the firecracker version for this pool (snapshot-family
+        /// rule). Any mismatch FAILs, even a newer version.
+        #[arg(long)]
+        expected_fc_version: Option<String>,
+        /// Minimum provisioned forkd-child-* netns (fan-out >1 needs
+        /// one per concurrent child). Fewer FAILs.
+        #[arg(long)]
+        min_netns: Option<usize>,
+        /// REST-spawn one sandbox from this snapshot tag (per-child
+        /// netns), then delete it. Proves restore+fork e2e.
+        #[arg(long)]
+        smoke_tag: Option<String>,
+        /// Guest port to TCP-probe after the smoke spawn (e.g. 49983
+        /// for envd). Implies --smoke-tag is set.
+        #[arg(long, requires = "smoke_tag")]
+        smoke_port: Option<u16>,
     },
     /// Quick latency probe against a live daemon. Runs a representative
     /// spawn → exec → branch (diff=true) → fanout → cleanup cycle and
@@ -996,7 +1016,22 @@ fn main() -> Result<()> {
         Cmd::Doctor {
             daemon_url,
             daemon_token,
-        } => doctor::run(&daemon_url, daemon_token),
+            json,
+            expected_fc_version,
+            min_netns,
+            smoke_tag,
+            smoke_port,
+        } => doctor::run_with(
+            doctor::DoctorOpts {
+                json,
+                expected_fc_version,
+                min_netns,
+                smoke_tag,
+                smoke_port,
+            },
+            &daemon_url,
+            daemon_token,
+        ),
         Cmd::Bench {
             tag,
             n,

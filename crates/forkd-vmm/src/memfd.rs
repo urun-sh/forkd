@@ -26,13 +26,17 @@
 //! targets this module's public surface returns errors so callers don't
 //! silently fall back to file-backed semantics.
 
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 // log2(2 MiB) = 21, shifted into the hugepage-size field per <linux/memfd.h>.
 #[cfg(target_os = "linux")]
@@ -76,6 +80,13 @@ impl MemfdRegion {
             std::process::id(),
             self.file.as_raw_fd()
         ))
+    }
+
+    /// Non-Linux stub: regions can only be created on Linux, but the
+    /// struct exists on every platform so callers compile.
+    #[cfg(not(target_os = "linux"))]
+    pub fn backend_path(&self) -> PathBuf {
+        PathBuf::new()
     }
 
     /// Return a duplicated `File` handle pointing at the same memfd.

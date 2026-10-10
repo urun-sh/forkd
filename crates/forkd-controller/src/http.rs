@@ -1372,6 +1372,14 @@ async fn create_sandbox(
             // ~1 bit per page; negligible.
             enable_diff_snapshots: true,
             sync_guest_clocks: true,
+            // s3-01: bound the clock-sync agent poll. A restored
+            // forkd-agent answers in well under a second; an
+            // agent-less snapshot (E2B-shaped envd images) has NO
+            // listener on :8888 and would otherwise burn the full
+            // 10s budget per spawn (measured 10-13s per POST
+            // /v1/sandboxes on forkd-p0-1). 2s covers slow agent
+            // bring-up while capping the agent-less penalty.
+            clock_sync_timeout_secs: 2,
             // Under spawn bursts (warm-pool refill) the default 10s socket
             // wait can be too tight when prior-VM tap/netns teardown races
             // with new firecracker spawns. Give the daemon path a more
@@ -3050,6 +3058,7 @@ fn spawn_one_for_workspace(
         memory_backend: forkd_vmm::MemoryBackend::File,
         enable_diff_snapshots: true,
         sync_guest_clocks: true,
+        clock_sync_timeout_secs: 2,
         socket_wait_timeout_secs: daemon_socket_wait_timeout_secs(),
     };
     let work_dir =

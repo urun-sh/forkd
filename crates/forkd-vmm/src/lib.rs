@@ -771,11 +771,21 @@ pub struct ForkOpts {
     /// that never starts. Callers that know their images contain
     /// forkd-agent (e.g. the daemon's spawn paths) set this to true.
     pub sync_guest_clocks: bool,
+    /// Per-child budget for the guest-agent readiness poll in the
+    /// clock-sync pass, in seconds. 0 uses `DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS`.
+    /// The daemon's sandbox-create path sets a SHORT budget: a restored
+    /// forkd-agent answers in well under a second, while an agent-less
+    /// snapshot (e.g. E2B-shaped images whose guest runs only envd)
+    /// burns the FULL budget per spawn for nothing. Callers that
+    /// expect slow agent bring-up can raise it.
+    pub clock_sync_timeout_secs: u64,
 }
 
 /// The historical hardcoded socket-wait budget, in seconds. Used as the
 /// default when `ForkOpts::socket_wait_timeout_secs` is 0.
 pub const DEFAULT_SOCKET_WAIT_SECS: u64 = 10;
+/// The historical hardcoded clock-sync agent-wait budget, in seconds.
+pub const DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS: u64 = 10;
 
 impl Default for ForkOpts {
     fn default() -> Self {
@@ -790,6 +800,7 @@ impl Default for ForkOpts {
             enable_diff_snapshots: false,
             socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
             sync_guest_clocks: false,
+            clock_sync_timeout_secs: DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
         }
     }
 }
@@ -1257,7 +1268,10 @@ pub fn live_children_with_indices<T>(children: &[Option<T>]) -> Vec<(usize, &T)>
 /// flattened slice, otherwise a hole (failed spawn/socket-wait) shifts
 /// every later survivor's reported index and breaks resource correlation
 /// (review feedback on #302: `children::flatten()` renumbers outcomes).
-fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>) {
+fn sync_guest_clocks(
+    children: &[(usize, &Vm)],
+    agent_timeout: Duration,
+) -> (u128, Vec<ClockSyncOutcome>) {
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(children.len());
@@ -1331,7 +1345,7 @@ fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>)
                 }
             };
 
-            sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT)
+            sync_one_child_clock(ping, now, set_clock, agent_timeout)
                 .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
         }));
     }
@@ -2483,6 +2497,7 @@ impl Snapshot {
                 enable_diff_snapshots: false,
                 socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
                 sync_guest_clocks: false,
+                clock_sync_timeout_secs: DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
             },
             work_dir,
         )
@@ -2847,7 +2862,12 @@ impl Snapshot {
             // survivor past a failed hole). `Vm` is not `Clone` (it owns a
             // Child process).
             let live: Vec<(usize, &Vm)> = live_children_with_indices(&children);
-            sync_guest_clocks(&live)
+            let agent_timeout = Duration::from_secs(if opts.clock_sync_timeout_secs == 0 {
+                DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS
+            } else {
+                opts.clock_sync_timeout_secs
+            });
+            sync_guest_clocks(&live, agent_timeout)
         } else {
             (0, Vec::new())
         };

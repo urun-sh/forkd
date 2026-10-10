@@ -263,9 +263,9 @@ fn print_report(checks: &[Check]) {
 /// `{"ready":true|false,"checks":[{"name","status","detail","hint"}]}`.
 /// Consumed by the VM-lane bootstrap (skypilot-controller runner) to
 /// gate worker readyz on `forkd doctor --json` exiting 0.
-fn print_json(checks: &[Check]) {
+fn json_output(checks: &[Check]) -> serde_json::Value {
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
-    let out = serde_json::json!({
+    serde_json::json!({
         "ready": !any_fail,
         "checks": checks
             .iter()
@@ -286,8 +286,11 @@ fn print_json(checks: &[Check]) {
                 obj
             })
             .collect::<Vec<_>>(),
-    });
-    println!("{out}");
+    })
+}
+
+fn print_json(checks: &[Check]) {
+    println!("{}", json_output(checks));
 }
 
 // ----------------------------------------------------------------------
@@ -852,7 +855,11 @@ fn check_smoke_spawn(
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .build();
-    let body = format!(r#"{{"snapshot_tag":"{tag}","per_child_netns":true}}"#);
+    let body = serde_json::json!({
+        "snapshot_tag": tag,
+        "per_child_netns": true,
+    })
+    .to_string();
     let spawn = match agent
         .post(&url)
         .set("Authorization", &format!("Bearer {token}"))
@@ -985,21 +992,25 @@ fn probe_guest_port(netns: &str, addr: &str) -> anyhow::Result<bool> {
         Ok(_) => return Err(anyhow::anyhow!("cannot enter netns {netns} (need root)")),
         Err(e) => return Err(anyhow::anyhow!("exec ip: {e}")),
     }
-    let out = Command::new("ip")
-        .args(["netns", "exec", netns])
+    // Connect from inside the netns. `timeout` caps the kernel's SYN
+    // retry window (~2 min without it) at 3 s per attempt so the
+    // gate's 10 s deadline is real; the address is passed as a
+    // positional parameter, never interpolated into the shell text.
+    let out = Command::new("timeout")
+        .arg("3")
+        .args(["ip", "netns", "exec", netns])
         .arg("bash")
         .arg("-c")
-        .arg(format!(
-            "exec 3<>/dev/tcp/{} && echo connected",
-            addr.replace(':', "/")
-        ))
+        .arg("exec 3<>/dev/tcp/$1 && echo connected")
+        .arg("--")
+        .arg(addr)
         .output();
     match out {
         Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("connected") => {
             Ok(true)
         }
         Ok(_) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("exec ip netns bash: {e}")),
+        Err(e) => Err(anyhow::anyhow!("exec timeout ip netns bash: {e}")),
     }
 }
 
@@ -1322,13 +1333,13 @@ mod tests {
 
     #[test]
     fn json_gate_warn_does_not_block_but_fail_does() {
-        // The readiness derivation print_json encodes: ready iff no
-        // FAIL. A WARN (docker absent, ksm off) must never gate a
+        // The serialized readiness the bootstrap consumes: ready iff
+        // no FAIL. A WARN (docker absent, ksm off) must never gate a
         // serving node red.
         let warn_only = vec![Check::pass("a", "ok"), Check::warn("b", "meh", "h")];
-        assert!(!warn_only.iter().any(|c| c.status == Status::Fail));
         let failing = vec![Check::pass("a", "ok"), Check::fail("b", "bad", "h")];
-        assert!(failing.iter().any(|c| c.status == Status::Fail));
+        assert_eq!(json_output(&warn_only)["ready"].as_bool(), Some(true));
+        assert_eq!(json_output(&failing)["ready"].as_bool(), Some(false));
     }
 
     #[test]

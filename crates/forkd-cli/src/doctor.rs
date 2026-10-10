@@ -903,13 +903,24 @@ fn check_smoke_spawn(
             "",
         );
     }
-    // Ensure cleanup on every path below.
+    // Ensure cleanup on every path below — and the smoke check FAILS
+    // if cleanup fails: a leaked probe sandbox on a "passing" node
+    // defeats the gate (it holds a netns and a firecracker slot).
     let delete = |check: Check| -> Check {
         let del_url = format!("{url}/{id}");
-        let _ = agent
+        let cleanup_ok = agent
             .delete(&del_url)
             .set("Authorization", &format!("Bearer {token}"))
-            .call();
+            .call()
+            .map(|r| r.status() < 300)
+            .unwrap_or(false);
+        if !cleanup_ok {
+            return Check::fail(
+                name,
+                format!("{} — but cleanup (DELETE {id}) failed; sandbox may be leaked", check.detail),
+                "delete the sandbox manually and re-run doctor; a leaked probe sandbox defeats the gate",
+            );
+        }
         check
     };
     // Optional guest-port probe (e.g. envd on :49983). Per-child-netns

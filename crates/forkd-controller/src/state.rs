@@ -482,7 +482,6 @@ impl Registry {
         }
     }
 
-
     /// Collect sandbox rows whose recorded pid is alive, with the
     /// identity data needed to re-adopt them (#301). Rows with dead
     /// pids were already pruned by `reconcile()`; rows with no pid are
@@ -511,14 +510,6 @@ impl Registry {
             }
         }
         (unresolved, orphans)
-    }
-
-    /// Remove one sandbox row and flush. Used by the #301 recovery path
-    /// for rows that could not be adopted AND could not be killed
-    /// safely (already-dead / PID-reuse cases).
-    pub(crate) fn prune_sandbox_row(&self, id: &str) -> Result<()> {
-        self.inner.lock().sandboxes.remove(id);
-        self.flush()
     }
 
     /// Recover sandbox rows orphaned by a controller restart (#301).
@@ -801,7 +792,10 @@ impl Registry {
             }
         }
         if adopted > 0 {
-            tracing::info!(adopted, "re-adopted live sandboxes after controller restart");
+            tracing::info!(
+                adopted,
+                "re-adopted live sandboxes after controller restart"
+            );
         }
         let stale_ws = self.mark_stale_workspaces();
         if killed > 0 || pruned_stale > 0 || stale_ws {
@@ -2486,9 +2480,12 @@ mod adopt_tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        let sock = Registry::child_sock_from_cmdline(pid)
-            .expect("parse --api-sock from live cmdline");
-        assert_eq!(sock, std::path::PathBuf::from("/tmp/fake-forkd/child-1.sock"));
+        let sock =
+            Registry::child_sock_from_cmdline(pid).expect("parse --api-sock from live cmdline");
+        assert_eq!(
+            sock,
+            std::path::PathBuf::from("/tmp/fake-forkd/child-1.sock")
+        );
         let _ = child.kill();
         let _ = child.wait();
         // Dead process: None.
@@ -2527,10 +2524,8 @@ mod adopt_tests {
     /// without a fresh reservation.
     #[test]
     fn adopt_active_index_blocks_reallocation() {
-        let alloc = crate::netns::NetnsAllocator::new(
-            8,
-            Box::new(crate::netns::RangeProbe { max: 8 }),
-        );
+        let alloc =
+            crate::netns::NetnsAllocator::new(8, Box::new(crate::netns::RangeProbe { max: 8 }));
         alloc.adopt_active_index(3);
         // The next reservation must NOT get index 3 (offset covering it).
         for _ in 0..8 {

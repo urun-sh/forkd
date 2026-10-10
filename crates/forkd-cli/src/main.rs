@@ -3213,7 +3213,6 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
     }
 }
 
-
 /// Is a pid still alive? /proc on Linux, `kill -0` elsewhere (macOS
 /// dev boxes have no /proc).
 fn process_alive(pid: u32) -> bool {
@@ -3264,7 +3263,6 @@ fn process_alive(pid: u32) -> bool {
 /// accumulate. A backup whose pid is still alive belongs to a concurrent
 /// bake of this tag and is left alone. Ordering is by ctime (park time);
 /// the filename breaks ties so the choice never depends on readdir order.
-
 fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let live = snap_dir.join("rootfs.ext4");

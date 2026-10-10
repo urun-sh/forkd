@@ -3116,7 +3116,13 @@ async fn create_workspace(
     };
     let s_clone = s.clone();
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &snapshot_tag, per_child_netns, memory_limit_mib, quota)
+        spawn_one_for_workspace(
+            &s_clone,
+            &snapshot_tag,
+            per_child_netns,
+            memory_limit_mib,
+            quota,
+        )
     })
     .await;
 
@@ -3442,7 +3448,13 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
     // which collides when several workspaces are active.
     let per_child_netns = ws.per_child_netns;
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None, Default::default())
+        spawn_one_for_workspace(
+            &s_clone,
+            &spawn_tag,
+            per_child_netns,
+            None,
+            Default::default(),
+        )
     })
     .await;
     let (vm, sb_info, mut netns_reservation, mut tap_claim) = match spawn_result {

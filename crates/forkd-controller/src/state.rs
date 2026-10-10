@@ -355,6 +355,36 @@ impl Registry {
         Some(std::path::Path::new(sock).parent()?.to_path_buf())
     }
 
+    /// The `--api-sock` path itself (not just its parent), for
+    /// reconstructing an adopted Vm's socket (#301).
+    pub(crate) fn child_sock_from_cmdline(pid: u32) -> Option<std::path::PathBuf> {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let idx = args
+            .iter()
+            .position(|a| a == "--api-sock")
+            .and_then(|i| args.get(i + 1))?;
+        Some(std::path::PathBuf::from(idx))
+    }
+
+    /// This child's rootfs backing inside its work dir, if one exists
+    /// (`child-<n>.<stem>`; see `is_child_backing`). Used so an adopted
+    /// Vm reclaims its backing on Drop exactly like a spawned child.
+    pub(crate) fn child_backing_in(work_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(work_dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if Self::is_child_backing(&name) {
+                return Some(entry.path());
+            }
+        }
+        None
+    }
+
     /// Is `name` a restored child's rootfs backing (`child-<n>.<stem>`)?
     ///
     /// The same dir also holds `child-<n>.sock` and `child-<n>.console`, and the
@@ -452,51 +482,84 @@ impl Registry {
         }
     }
 
-    pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
+
+    /// Collect sandbox rows whose recorded pid is alive, with the
+    /// identity data needed to re-adopt them (#301). Rows with dead
+    /// pids were already pruned by `reconcile()`; rows with no pid are
+    /// counted as `unresolved` (startup blocker, unchanged).
+    ///
+    /// This replaces the "collect then SIGKILL" first half of
+    /// `kill_orphans`: the caller now decides per row — adopt the
+    /// identity-verified ones, kill the ones that cannot be adopted.
+    /// The kill path for unadoptable rows still lives in
+    /// `kill_orphans`, which now takes the candidate list as input.
+    pub(crate) fn collect_orphans(&self) -> (usize, Vec<OrphanCandidate>) {
+        let g = self.inner.lock();
+        let mut unresolved = 0usize;
+        let mut orphans = Vec::new();
+        for (id, sb) in g.sandboxes.iter() {
+            match sb.pid {
+                Some(pid) if pid_alive(pid) => orphans.push(OrphanCandidate {
+                    id: id.clone(),
+                    pid,
+                    proc_starttime: sb.proc_starttime,
+                    boot_id: sb.boot_id.clone(),
+                    netns: sb.netns.clone(),
+                }),
+                Some(_) => {} // dead PID: reconcile() already pruned it
+                None => unresolved += 1,
+            }
+        }
+        (unresolved, orphans)
+    }
+
+    /// Remove one sandbox row and flush. Used by the #301 recovery path
+    /// for rows that could not be adopted AND could not be killed
+    /// safely (already-dead / PID-reuse cases).
+    pub(crate) fn prune_sandbox_row(&self, id: &str) -> Result<()> {
+        self.inner.lock().sandboxes.remove(id);
+        self.flush()
+    }
+
+    /// Recover sandbox rows orphaned by a controller restart (#301).
+    ///
+    /// Rows whose recorded pid is alive and whose durable identity
+    /// (start time + boot id) verifies are offered to `adopt` FIRST —
+    /// the caller re-attaches a managing `Vm` handle so the sandbox
+    /// survives the restart instead of being killed. Rows `adopt`
+    /// declines (returns `false`), and rows that fail identity
+    /// verification, go through the #298 kill/prune machinery unchanged.
+    ///
+    /// The fail-closed contract is preserved: no live-pid row is ever
+    /// left registered-but-unmanaged at startup — it is either adopted
+    /// (the caller now manages it) or killed and pruned, or its count
+    /// surfaces as a startup blocker exactly as before.
+    pub(crate) fn recover_orphans<F>(&self, mut adopt: F) -> Result<KillOrphansResult>
+    where
+        F: FnMut(&OrphanCandidate) -> bool,
+    {
         // Sweep before the reap: in the restart case the children are already
         // dead, so their rows are retired without a kill and `Vm::drop` never
         // runs for them. Their directories are unowned by now, which is exactly
         // what the sweep requires.
         Self::sweep_stranded_backings();
-        // One collected orphan: (sandbox id, pid, recorded start time,
-        // recorded boot id).
-        type OrphanRow = (String, u32, Option<u64>, Option<String>);
 
-        // Single lock pass over retained rows (review #299 non-blocking:
-        // fold the previous two acquisitions into one guard):
-        //  - `unresolved`: rows with NO recorded PID. Such an entry is
-        //    legacy/corrupt identity (every production registration path
-        //    writes `Some(pid)`), but the absence of a PID is NOT evidence
-        //    that no live VM is holding its netns/tap resources — on the
-        //    contrary, it mirrors the #298 collision risk if we simply
-        //    skip it and start with an empty allocator. The caller treats
-        //    `unresolved > 0` as a startup blocker (fail closed).
-        //  - `orphans`: rows with a live PID, collected with their
-        //    recorded durable identity (start time + boot id). The lock
-        //    is dropped before any kill so the (bounded) wait_for_death
-        //    poll never holds the registry mutex.
-        let (unresolved, orphans): (usize, Vec<OrphanRow>) = {
-            let g = self.inner.lock();
-            let mut unresolved = 0usize;
-            let mut orphans = Vec::new();
-            for (id, sb) in g.sandboxes.iter() {
-                match sb.pid {
-                    Some(pid) if pid_alive(pid) => {
-                        orphans.push((id.clone(), pid, sb.proc_starttime, sb.boot_id.clone()))
-                    }
-                    Some(_) => {} // dead PID: reconcile() has already pruned these
-                    None => unresolved += 1,
-                }
-            }
-            (unresolved, orphans)
-        };
+        // `collect_orphans` holds the lock only for the scan; identity
+        // verification, adoption and (bounded) kill waits all run with it
+        // released.
+        let (unresolved, orphans) = self.collect_orphans();
 
         let mut killed = 0usize;
         let mut pruned_stale = 0usize;
         let mut kill_failed = 0usize;
         let mut legacy_unverified = 0usize;
+        let mut adopted = 0usize;
 
-        for (id, pid, recorded_starttime, recorded_boot_id) in orphans {
+        for cand in &orphans {
+            let id = cand.id.clone();
+            let pid = cand.pid;
+            let recorded_starttime = cand.proc_starttime;
+            let recorded_boot_id = cand.boot_id.clone();
             // Primary identity check: compare the live process start time
             // (gated by the persisted boot id) against the record at
             // registration. This is the durable identity that survives
@@ -601,10 +664,28 @@ impl Registry {
                         continue;
                     }
 
+                    // #301: identity-verified live child — try to RE-ADOPT
+                    // before killing. The controller restarting must not
+                    // mass-prune sandboxes that are still healthy; adopt
+                    // reconstructs a managing Vm handle so the row keeps
+                    // its lease semantics across restarts. Only when the
+                    // caller cannot adopt (socket gone, FC not answering)
+                    // does the #298 kill path run.
+                    if adopt(cand) {
+                        let _ = unsafe { libc::close(pidfd) };
+                        tracing::info!(
+                            sandbox_id = %id,
+                            pid = pid,
+                            "re-adopted live Firecracker after controller restart"
+                        );
+                        adopted += 1;
+                        continue;
+                    }
+
                     tracing::warn!(
                         sandbox_id = %id,
                         pid = pid,
-                        "killing orphaned Firecracker process on startup (pidfd signal, identity verified)"
+                        "adoption declined; killing orphaned Firecracker on startup (pidfd signal, identity verified)"
                     );
                     // Read the child's work dir now: once the process is gone
                     // there is nothing left in /proc to read it from, and the
@@ -719,7 +800,9 @@ impl Registry {
                 }
             }
         }
-
+        if adopted > 0 {
+            tracing::info!(adopted, "re-adopted live sandboxes after controller restart");
+        }
         let stale_ws = self.mark_stale_workspaces();
         if killed > 0 || pruned_stale > 0 || stale_ws {
             self.flush()?;
@@ -733,11 +816,33 @@ impl Registry {
         })
     }
 
+    /// Legacy entry point: recover with NO adoption — every
+    /// identity-verified live row is killed and pruned, exactly the
+    /// pre-#301 behavior. Used by tests; `run_daemon` calls
+    /// `recover_orphans` with a real adoption closure instead.
+    #[cfg(test)]
+    pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
+        self.recover_orphans(|_| false)
+    }
+
     /// For metrics: live counts.
     pub fn counts(&self) -> (usize, usize) {
         let g = self.inner.lock();
         (g.snapshots.len(), g.sandboxes.len())
     }
+}
+
+/// One collected orphan row for [`Registry::collect_orphans`]:
+/// everything the #301 adoption path needs to reconstruct a managing
+/// `Vm` handle, plus the durable identity (start time + boot id) for
+/// the pre-adopt verification.
+#[derive(Debug, Clone)]
+pub(crate) struct OrphanCandidate {
+    pub id: String,
+    pub pid: u32,
+    pub proc_starttime: Option<u64>,
+    pub boot_id: Option<String>,
+    pub netns: Option<String>,
 }
 
 /// Result of `kill_orphans`: how many were actually killed, pruned as
@@ -2349,5 +2454,92 @@ mod tests {
         // wait() returns once the process is gone; join it to ensure cleanup.
         let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         let _ = reaper.join();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #301 re-adoption unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// `child_sock_from_cmdline` reads the `--api-sock` argument of a
+    /// live process. Linux-only (needs /proc/<pid>/cmdline); the off-Linux
+    /// stub returns None which the recovery path treats as
+    /// "decline adoption → kill", the fail-closed direction.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn child_sock_from_cmdline_parses_api_sock_arg() {
+        use std::process::{Command, Stdio};
+        // A process with "--api-sock <path>" in argv. Use `sleep` with a
+        // fake arg: cmdline reading doesn't care about the binary.
+        let mut child = Command::new("sleep")
+            .arg("--api-sock")
+            .arg("/tmp/fake-forkd/child-1.sock")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let sock = Registry::child_sock_from_cmdline(pid)
+            .expect("parse --api-sock from live cmdline");
+        assert_eq!(sock, std::path::PathBuf::from("/tmp/fake-forkd/child-1.sock"));
+        let _ = child.kill();
+        let _ = child.wait();
+        // Dead process: None.
+        assert!(
+            Registry::child_sock_from_cmdline(pid).is_none(),
+            "dead pid must return None (decline adoption)"
+        );
+    }
+
+    /// `child_backing_in` finds the `child-<n>.<stem>` rootfs backing in
+    /// a work dir and ignores sibling sockets/consoles.
+    #[test]
+    fn child_backing_in_finds_backing_not_socks() {
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join("child-1.sock"), b"").unwrap();
+        std::fs::write(td.path().join("child-1.console"), b"").unwrap();
+        std::fs::write(td.path().join("child-1.rootfs.ext4"), b"ext4").unwrap();
+
+        let backing = Registry::child_backing_in(td.path())
+            .expect("backing must be found among sock/console siblings");
+        assert_eq!(
+            backing,
+            td.path().join("child-1.rootfs.ext4"),
+            "must pick the ext4 backing, not the socket or console"
+        );
+
+        // No backing in the dir → None (booted-directly child; Drop must
+        // not try to remove a nonexistent file).
+        let empty = TempDir::new().unwrap();
+        assert!(Registry::child_backing_in(empty.path()).is_none());
+    }
+
+    /// A re-adopted VM's netns index must be ACTIVE in the allocator so a
+    /// new spawn cannot take `forkd-child-N` from a live VM. Red-first:
+    /// before #301 recovery there was no way to mark an index active
+    /// without a fresh reservation.
+    #[test]
+    fn adopt_active_index_blocks_reallocation() {
+        let alloc = crate::netns::NetnsAllocator::new(
+            8,
+            Box::new(crate::netns::RangeProbe { max: 8 }),
+        );
+        alloc.adopt_active_index(3);
+        // The next reservation must NOT get index 3 (offset covering it).
+        for _ in 0..8 {
+            let r = alloc.reserve(1).expect("reserve must succeed");
+            assert_ne!(
+                r.offset() + 1,
+                3,
+                "adopted index 3 must not be handed to a new spawn"
+            );
+        }
     }
 }

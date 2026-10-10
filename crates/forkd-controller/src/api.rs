@@ -248,8 +248,15 @@ pub struct CreateSandboxRequest {
     pub snapshot_tag: String,
     #[serde(default = "default_one")]
     pub n: usize,
+    /// Per-child network namespaces: each child gets its own
+    /// `forkd-child-<i>` netns (provisioned by
+    /// `scripts/netns-setup.sh`). When ABSENT, the controller picks:
+    /// n=1 → shared host tap (historical default); n>1 → per-child
+    /// netns (S3-01 fan-out fix — a shared tap cannot back a
+    /// multi-child batch). An explicit `false` keeps the shared-tap
+    /// topology and still 503s for n>1.
     #[serde(default)]
-    pub per_child_netns: bool,
+    pub per_child_netns: Option<bool>,
     /// Optional memory limit in MiB. Enforced via cgroup v2 if available.
     #[serde(default)]
     pub memory_limit_mib: Option<u64>,

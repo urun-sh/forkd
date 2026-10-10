@@ -6,6 +6,21 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased
 
+### n>1 REST spawns default to per-child netns (fan-out unblocked)
+
+`POST /v1/sandboxes` with `n>1` and no explicit `per_child_netns` used to
+503 ("shared-TAP spawns with n>1 are not supported"): every child would
+open the same host `forkd-tap0`, and the tap name is frozen into the
+snapshot's vmstate, so a multi-restore batch raced one tap fd
+(`Open tap device failed: Resource busy (os error 16)` on stock builds).
+The request field is now optional — absent means the controller picks:
+`n=1` keeps the historical shared-tap path, `n>1` routes through the
+per-child-netns allocator (each child gets its own `forkd-tap0` inside
+its `forkd-child-<i>` namespace, provisioned by `scripts/netns-setup.sh`).
+An explicit `per_child_netns: false` with `n>1` still fails loudly with
+the same 503 rather than silently degrading; pool exhaustion surfaces
+as a distinct "netns pool exhausted" 503 naming the operator remedy.
+
 ### Reflink copies actually reflink
 
 `chain::reflink_copy` passed `0x40209409` as `FICLONE`; the real number is

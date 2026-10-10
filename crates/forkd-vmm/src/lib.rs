@@ -17,8 +17,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -773,11 +771,21 @@ pub struct ForkOpts {
     /// that never starts. Callers that know their images contain
     /// forkd-agent (e.g. the daemon's spawn paths) set this to true.
     pub sync_guest_clocks: bool,
+    /// Per-child budget for the guest-agent readiness poll in the
+    /// clock-sync pass, in seconds. 0 uses `DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS`.
+    /// The daemon's sandbox-create path sets a SHORT budget: a restored
+    /// forkd-agent answers in well under a second, while an agent-less
+    /// snapshot (e.g. E2B-shaped images whose guest runs only envd)
+    /// burns the FULL budget per spawn for nothing. Callers that
+    /// expect slow agent bring-up can raise it.
+    pub clock_sync_timeout_secs: u64,
 }
 
 /// The historical hardcoded socket-wait budget, in seconds. Used as the
 /// default when `ForkOpts::socket_wait_timeout_secs` is 0.
 pub const DEFAULT_SOCKET_WAIT_SECS: u64 = 10;
+/// The historical hardcoded clock-sync agent-wait budget, in seconds.
+pub const DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS: u64 = 10;
 
 impl Default for ForkOpts {
     fn default() -> Self {
@@ -792,6 +800,7 @@ impl Default for ForkOpts {
             enable_diff_snapshots: false,
             socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
             sync_guest_clocks: false,
+            clock_sync_timeout_secs: DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
         }
     }
 }
@@ -1128,13 +1137,12 @@ fn kernel_supports_kvm_clock_realtime(release: &str) -> bool {
 /// is its own broadcast domain so there is no conflict.
 const GUEST_AGENT_ADDR: &str = "10.42.0.2:8888";
 
-/// Maximum time to wait for the guest agent to come up after restore.
-/// The agent is forkd-agent.py running as PID 1 inside the guest. It
-/// starts as soon as the kernel finishes booting and init runs, which
-/// for snapshot-restored VMs is typically sub-second. The 10-second
-/// budget covers slow hosts, cold cache, and large rootfs images.
+/// Test-only mirror of `DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS`: the
+/// runtime budget now flows through `ForkOpts::clock_sync_timeout_secs`
+/// (717846a); the deterministic clock-sync tests below use this
+/// historical 10 s budget directly.
+#[cfg(test)]
 const CLOCK_SYNC_AGENT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Per-call timeout for the `date -s` exec itself.
 const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1259,7 +1267,10 @@ pub fn live_children_with_indices<T>(children: &[Option<T>]) -> Vec<(usize, &T)>
 /// flattened slice, otherwise a hole (failed spawn/socket-wait) shifts
 /// every later survivor's reported index and breaks resource correlation
 /// (review feedback on #302: `children::flatten()` renumbers outcomes).
-fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>) {
+fn sync_guest_clocks(
+    children: &[(usize, &Vm)],
+    agent_timeout: Duration,
+) -> (u128, Vec<ClockSyncOutcome>) {
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(children.len());
@@ -1333,7 +1344,7 @@ fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>)
                 }
             };
 
-            sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT)
+            sync_one_child_clock(ping, now, set_clock, agent_timeout)
                 .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
         }));
     }
@@ -2485,6 +2496,7 @@ impl Snapshot {
                 enable_diff_snapshots: false,
                 socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
                 sync_guest_clocks: false,
+                clock_sync_timeout_secs: DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
             },
             work_dir,
         )
@@ -2849,7 +2861,12 @@ impl Snapshot {
             // survivor past a failed hole). `Vm` is not `Clone` (it owns a
             // Child process).
             let live: Vec<(usize, &Vm)> = live_children_with_indices(&children);
-            sync_guest_clocks(&live)
+            let agent_timeout = Duration::from_secs(if opts.clock_sync_timeout_secs == 0 {
+                DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS
+            } else {
+                opts.clock_sync_timeout_secs
+            });
+            sync_guest_clocks(&live, agent_timeout)
         } else {
             (0, Vec::new())
         };
@@ -3632,6 +3649,20 @@ mod tests {
         // every existing caller silently.
         let opts = ForkOpts::default();
         assert!(matches!(opts.memory_backend, MemoryBackend::File));
+    }
+
+    #[test]
+    fn fork_opts_clock_sync_default_is_historical_10s() {
+        // The daemon passes 2s explicitly; the default must stay at the
+        // historical 10s so CLI paths and restore() keep their budget,
+        // and a 0 value must fall back to the same default rather than
+        // becoming a zero-second poll (717846a).
+        let opts = ForkOpts::default();
+        assert_eq!(
+            opts.clock_sync_timeout_secs,
+            DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS
+        );
+        assert_eq!(DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS, 10);
     }
 
     #[test]

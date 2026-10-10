@@ -2607,6 +2607,7 @@ fn run_cmd(
                 memory_backend: forkd_vmm::MemoryBackend::File,
                 enable_diff_snapshots: false,
                 sync_guest_clocks: false,
+                clock_sync_timeout_secs: forkd_vmm::DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
                 socket_wait_timeout_secs: forkd_vmm::DEFAULT_SOCKET_WAIT_SECS,
             },
             &work_dir,
@@ -4043,6 +4044,7 @@ fn fork_cmd(
                 // CLI fork doesn't outlive its invocation, no diff snapshots.
                 enable_diff_snapshots: false,
                 sync_guest_clocks: false,
+                clock_sync_timeout_secs: forkd_vmm::DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
                 socket_wait_timeout_secs: forkd_vmm::DEFAULT_SOCKET_WAIT_SECS,
             },
             &work_dir,

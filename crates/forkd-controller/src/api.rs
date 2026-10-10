@@ -253,6 +253,14 @@ pub struct CreateSandboxRequest {
     /// Optional memory limit in MiB. Enforced via cgroup v2 if available.
     #[serde(default)]
     pub memory_limit_mib: Option<u64>,
+    /// Optional `cpu.max` value ("<quota> <period>" in µs, e.g.
+    /// "200000 100000" = 2 CPUs). Enforced via cgroup v2 alongside the
+    /// memory limit (#159).
+    #[serde(default)]
+    pub cpu_max: Option<String>,
+    /// Optional `pids.max` cap for the child cgroup (#159).
+    #[serde(default)]
+    pub pids_max: Option<u64>,
     /// If true, immediately after each child is restored, perform a
     /// throwaway snapshot to scratch storage to fault-in all guest pages
     /// and populate KVM EPT. This amortizes the cold-cache penalty (2-9x
@@ -411,6 +419,11 @@ pub struct CreateWorkspaceRequest {
     pub per_child_netns: bool,
     #[serde(default)]
     pub memory_limit_mib: Option<u64>,
+    /// Optional `cpu.max` / `pids.max` for the workspace's child cgroup (#159).
+    #[serde(default)]
+    pub cpu_max: Option<String>,
+    #[serde(default)]
+    pub pids_max: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,4 +563,53 @@ pub struct DeleteSnapshotQuery {
     /// with `cascade` — when both set, the daemon errors with 400.
     #[serde(default)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    /// #159: a create-sandbox request carrying cpu/pids quotas must
+    /// deserialize them (the spawn handler forwards them into
+    /// ForkOpts.quota → cgroup cpu.max / pids.max on the node).
+    #[test]
+    fn create_sandbox_request_parses_cpu_pids_quota() {
+        let body = r#"{
+            "snapshot_tag": "py",
+            "n": 2,
+            "per_child_netns": true,
+            "memory_limit_mib": 512,
+            "cpu_max": "200000 100000",
+            "pids_max": 512
+        }"#;
+        let req: CreateSandboxRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(req.memory_limit_mib, Some(512));
+        assert_eq!(req.cpu_max.as_deref(), Some("200000 100000"));
+        assert_eq!(req.pids_max, Some(512));
+    }
+
+    /// Quotas are optional: an old-shape request still parses with
+    /// both fields None (no behavior change for existing callers).
+    #[test]
+    fn create_sandbox_request_quota_fields_default_none() {
+        let body = r#"{"snapshot_tag": "py"}"#;
+        let req: CreateSandboxRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(req.cpu_max, None);
+        assert_eq!(req.pids_max, None);
+    }
+
+    /// Workspace create carries the same quota fields (#159).
+    #[test]
+    fn create_workspace_request_parses_cpu_pids_quota() {
+        let body = r#"{
+            "name": "ws",
+            "snapshot_tag": "py",
+            "memory_limit_mib": 1024,
+            "cpu_max": "50000 100000",
+            "pids_max": 64
+        }"#;
+        let req: CreateWorkspaceRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(req.cpu_max.as_deref(), Some("50000 100000"));
+        assert_eq!(req.pids_max, Some(64));
+    }
 }

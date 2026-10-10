@@ -702,6 +702,10 @@ pub struct ForkOpts {
     /// leaf with `memory.max` set to this many MiB. Requires cgroup v2
     /// unified hierarchy and root (or a delegated cgroup). See `cgroup.rs`.
     pub memory_limit_mib: Option<u64>,
+    /// Optional cpu/pids quotas applied to each child's cgroup v2 leaf
+    /// alongside `memory_limit_mib` (#159). Ignored when
+    /// `memory_limit_mib` is `None` (no cgroup leaf is created at all).
+    pub quota: cgroup::ChildQuota,
     /// Offset added to the per-child netns / cgroup index. Default 0
     /// produces the historical `forkd-child-1..N` naming. Set to >0 when
     /// other sandboxes already occupy lower indices (e.g. branching: the
@@ -777,6 +781,7 @@ impl Default for ForkOpts {
             n: 1,
             per_child_netns: false,
             memory_limit_mib: None,
+            quota: cgroup::ChildQuota::default(),
             netns_offset: 0,
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
@@ -2400,6 +2405,7 @@ impl Snapshot {
                 n,
                 per_child_netns: false,
                 memory_limit_mib: None,
+                quota: cgroup::ChildQuota::default(),
                 netns_offset: 0,
                 prewarm_scratch_dir: None,
                 memory_backend: MemoryBackend::File,
@@ -2578,7 +2584,7 @@ impl Snapshot {
                 // resource limits don't collide with siblings created by other
                 // batches on the same host.
                 let name = format!("child-{}", opts.netns_offset + i + 1);
-                match cgroup::place_child(&name, child.pid, bytes) {
+                match cgroup::place_child(&name, child.pid, bytes, opts.quota.clone()) {
                     Ok(path) => {
                         tracing::debug!(name=%name, pid=child.pid, mib, "cgroup placed");
                         child.cgroup = Some(path);
@@ -4133,6 +4139,7 @@ mod tests {
             n: 1,
             per_child_netns: false,
             memory_limit_mib: None,
+            quota: cgroup::ChildQuota::default(),
             netns_offset: 0,
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,

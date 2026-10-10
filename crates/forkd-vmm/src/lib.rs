@@ -1137,13 +1137,12 @@ fn kernel_supports_kvm_clock_realtime(release: &str) -> bool {
 /// is its own broadcast domain so there is no conflict.
 const GUEST_AGENT_ADDR: &str = "10.42.0.2:8888";
 
-/// Maximum time to wait for the guest agent to come up after restore.
-/// The agent is forkd-agent.py running as PID 1 inside the guest. It
-/// starts as soon as the kernel finishes booting and init runs, which
-/// for snapshot-restored VMs is typically sub-second. The 10-second
-/// budget covers slow hosts, cold cache, and large rootfs images.
+/// Test-only mirror of `DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS`: the
+/// runtime budget now flows through `ForkOpts::clock_sync_timeout_secs`
+/// (717846a); the deterministic clock-sync tests below use this
+/// historical 10 s budget directly.
+#[cfg(test)]
 const CLOCK_SYNC_AGENT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Per-call timeout for the `date -s` exec itself.
 const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3650,6 +3649,20 @@ mod tests {
         // every existing caller silently.
         let opts = ForkOpts::default();
         assert!(matches!(opts.memory_backend, MemoryBackend::File));
+    }
+
+    #[test]
+    fn fork_opts_clock_sync_default_is_historical_10s() {
+        // The daemon passes 2s explicitly; the default must stay at the
+        // historical 10s so CLI paths and restore() keep their budget,
+        // and a 0 value must fall back to the same default rather than
+        // becoming a zero-second poll (717846a).
+        let opts = ForkOpts::default();
+        assert_eq!(
+            opts.clock_sync_timeout_secs,
+            DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS
+        );
+        assert_eq!(DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS, 10);
     }
 
     #[test]

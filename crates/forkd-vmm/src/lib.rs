@@ -1834,7 +1834,6 @@ fn spawn_firecracker_in(netns: Option<&str>, sock: &Path, console: &Path) -> Res
 // ---------------------------------------------------------------------------
 
 impl Vm {
-
     /// Adopt an already-running Firecracker process (#301).
     ///
     /// After a controller restart the previous instance's children are
@@ -5158,56 +5157,56 @@ mod tests {
     }
 }
 
-    // ------------------------------------------------------------------
-    // #301: adoption of an already-running Firecracker
-    // ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// #301: adoption of an already-running Firecracker
+// ------------------------------------------------------------------
 
-    /// `Vm::adopt` must refuse a socket that does not exist: a stale
-    /// registry row pointing at a cleaned-up work dir must not yield a
-    /// handle that looks managed while the process is gone (that would
-    /// defeat the fail-closed recovery contract).
-    #[test]
-    fn adopt_refuses_missing_socket() {
-        let tmp = std::env::temp_dir().join(format!("forkd-adopt-{}.d", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let sock = tmp.join("child-1.sock");
-        let err = Vm::adopt(
-            424242,
-            sock.clone(),
-            tmp.join("child-1.console"),
-            None,
-            None,
-        )
-        .expect_err("adopt must fail when the api socket is missing");
-        assert!(
-            format!("{err:#}").contains("does not exist"),
-            "error must name the missing socket: {err:#}"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
+/// `Vm::adopt` must refuse a socket that does not exist: a stale
+/// registry row pointing at a cleaned-up work dir must not yield a
+/// handle that looks managed while the process is gone (that would
+/// defeat the fail-closed recovery contract).
+#[test]
+fn adopt_refuses_missing_socket() {
+    let tmp = std::env::temp_dir().join(format!("forkd-adopt-{}.d", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let sock = tmp.join("child-1.sock");
+    let err = Vm::adopt(
+        424242,
+        sock.clone(),
+        tmp.join("child-1.console"),
+        None,
+        None,
+    )
+    .expect_err("adopt must fail when the api socket is missing");
+    assert!(
+        format!("{err:#}").contains("does not exist"),
+        "error must name the missing socket: {err:#}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
 
-    /// `Vm::adopt` must refuse a socket whose backing process does not
-    /// answer `GET /vm/config`: a dead Firecracker leaves a stale socket
-    /// file behind, and adopting it would hand out a "managed" handle for
-    /// a dead VM. A socket with no listener must fail the probe.
-    #[test]
-    fn adopt_refuses_dead_socket_file() {
-        let tmp = std::env::temp_dir().join(format!("forkd-adopt2-{}.d", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let sock = tmp.join("child-1.sock");
-        // A file at the socket path, but nobody listening on it: any
-        // connect() gets ECONNREFUSED.
-        std::fs::write(&sock, b"stale").unwrap();
-        let result = Vm::adopt(
-            424242,
-            sock.clone(),
-            tmp.join("child-1.console"),
-            None,
-            None,
-        );
-        assert!(
-            result.is_err(),
-            "adopt must fail when nothing answers on the socket"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
+/// `Vm::adopt` must refuse a socket whose backing process does not
+/// answer `GET /vm/config`: a dead Firecracker leaves a stale socket
+/// file behind, and adopting it would hand out a "managed" handle for
+/// a dead VM. A socket with no listener must fail the probe.
+#[test]
+fn adopt_refuses_dead_socket_file() {
+    let tmp = std::env::temp_dir().join(format!("forkd-adopt2-{}.d", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let sock = tmp.join("child-1.sock");
+    // A file at the socket path, but nobody listening on it: any
+    // connect() gets ECONNREFUSED.
+    std::fs::write(&sock, b"stale").unwrap();
+    let result = Vm::adopt(
+        424242,
+        sock.clone(),
+        tmp.join("child-1.console"),
+        None,
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "adopt must fail when nothing answers on the socket"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}

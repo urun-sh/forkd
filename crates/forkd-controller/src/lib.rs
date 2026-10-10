@@ -330,7 +330,10 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         {
             let mut live = app_state.live_vms.lock();
             for (id, vm) in adopted {
-                if let Some(ns) = vm.netns.as_deref().and_then(|n| n.strip_prefix("forkd-child-"))
+                if let Some(ns) = vm
+                    .netns
+                    .as_deref()
+                    .and_then(|n| n.strip_prefix("forkd-child-"))
                 {
                     if let Ok(idx) = ns.parse::<usize>() {
                         app_state.netns_alloc.adopt_active_index(idx);

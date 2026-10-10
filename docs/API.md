@@ -183,6 +183,12 @@ Request:
 - `per_child_netns` — when true, each child is placed in
   `forkd-child-<i>`; the host must have provisioned those namespaces
   via `scripts/netns-setup.sh N` first.
+  **Implied `true` when `n > 1`**: a shared-tap batch cannot have more
+  than one child (every child would open the same host `forkd-tap0`,
+  and the tap name is frozen into the snapshot vmstate), so `n > 1`
+  requests are auto-routed to per-child netns regardless of this
+  flag. A 503 "netns pool exhausted" means the host needs more
+  provisioned namespaces, not a tap conflict.
 - `memory_limit_mib` — sets `memory.max` on a per-child cgroup v2
   leaf. Requires cgroup v2 unified hierarchy and write access to
   `/sys/fs/cgroup/forkd/`.

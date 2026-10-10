@@ -111,6 +111,7 @@ pub fn run_with(opts: DoctorOpts, daemon_url: &str, daemon_token: Option<String>
         check_kvm(),
         check_cgroup_v2(),
         check_ip_forward(),
+        check_arp_gc(),
         check_tap_device("forkd-tap0"),
         check_netns_count(),
         check_firecracker_binary(),
@@ -372,6 +373,49 @@ fn check_ip_forward() -> Check {
         ),
         Err(e) => Check::warn("ip_forward", format!("{e}"), "expected on Linux"),
     }
+}
+
+/// ARP neighbor-table gc thresholds. Each per-child netns carries its
+/// own neighbor table; a pool of 100+ netns overflows the defaults
+/// (128/512/1024) during big fan-outs and every spawn then stalls in
+/// guest-net bring-up with `neighbour: arp_cache: neighbor table
+/// overflow!` in dmesg (observed on the Phase 0 C3 node after an
+/// n=100 REST fan-out). WARN — a fresh node passes at first and the
+/// fix is one sysctl, but a serving pool must raise it.
+#[cfg(target_os = "linux")]
+fn check_arp_gc() -> Check {
+    let read = |n: &str| std::fs::read_to_string(format!("/proc/sys/net/ipv4/neigh/default/{n}"))
+        .map(|v| v.trim().to_string())
+        .ok();
+    let t1 = read("gc_thresh1");
+    let t2 = read("gc_thresh2");
+    let t3 = read("gc_thresh3");
+    match (t1.clone(), t2.clone(), t3.clone()) {
+        (Some(a), Some(b), Some(c)) => {
+            let parse = |v: &String| v.parse::<u64>().unwrap_or(0);
+            // Defaults 128/512/1024 are fine for a laptop and starve
+            // a 120-netns pool under fan-out.
+            if parse(&a) >= 1024 && parse(&b) >= 4096 && parse(&c) >= 8192 {
+                Check::pass("arp gc_thresh", format!("{a}/{b}/{c}"))
+            } else {
+                Check::warn(
+                    "arp gc_thresh",
+                    format!("{a}/{b}/{c} (defaults 128/512/1024 overflow under 100+ netns fan-out)"),
+                    "sudo sysctl -w net.ipv4.neigh.default.gc_thresh1=4096 gc_thresh2=8192 gc_thresh3=16384",
+                )
+            }
+        }
+        _ => Check::warn(
+            "arp gc_thresh",
+            "gc_thresh sysctls unreadable".to_string(),
+            "expected on Linux",
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_arp_gc() -> Check {
+    Check::skip("arp gc_thresh", "not Linux")
 }
 
 fn check_tap_device(tap: &'static str) -> Check {

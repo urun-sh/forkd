@@ -1213,7 +1213,15 @@ async fn create_sandbox(
         None
     };
     let spawn_n = req.n;
-    let spawn_per_child_netns = req.per_child_netns;
+    // S3-01 fan-out fix: an ABSENT `per_child_netns` defaults to true
+    // when n>1. A shared-tap batch (all children on one host tap fd)
+    // can neither restore concurrently nor address children
+    // individually, so the only working multi-child topology is
+    // per-child netns — make it the default instead of 503ing (s2-03
+    // receipt: "REST n>1 fails — shared tap busy"). An explicit
+    // `per_child_netns: false` with n>1 still hits the 503 below; n=1
+    // is unchanged (shared tap unless the caller opts into a netns).
+    let spawn_per_child_netns = req.per_child_netns.unwrap_or(req.n > 1);
     let spawn_mem_limit = req.memory_limit_mib;
     let spawn_quota = forkd_vmm::cgroup::ChildQuota {
         cpu_max: req.cpu_max.clone(),
@@ -1229,7 +1237,7 @@ async fn create_sandbox(
     // handler between restore success and registration does not wedge
     // the tap permanently. The token is the first child's sandbox id;
     // release_shared_tap_if_owner checks against it on teardown.
-    let use_shared_tap = !req.per_child_netns;
+    let use_shared_tap = !spawn_per_child_netns;
     let tap_owner_cell = s.shared_tap_owner.clone();
     let tap_token = if use_shared_tap {
         Some(new_sandbox_id())
@@ -1243,7 +1251,7 @@ async fn create_sandbox(
     // remain live on the same tap fd, causing EBUSY on the next
     // shared-tap spawn. The common case is n=1; n>1 shared-TAP spawns
     // are rejected with 503 until per-child tap ownership is modeled.
-    if use_shared_tap && req.n > 1 {
+    if use_shared_tap && spawn_n > 1 {
         return service_unavailable(
             "shared-TAP spawns with n>1 are not supported; use per_child_netns=true for multi-child spawns",
         );
@@ -4547,6 +4555,78 @@ mod tests {
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "per-netns spawn must not hit the shared-tap 503 path"
+        );
+    }
+
+    /// S3-01 fan-out: `POST /v1/sandboxes` with `n>1` and no explicit
+    /// `per_child_netns` must fan out over per-child netns instead of
+    /// being rejected by the shared-tap n>1 guard. The request below
+    /// pins the default: it must NOT take the shared-tap path (which
+    /// 503s) — it must reserve per-child netns (0-pool here => the
+    /// documented NetnsExhausted 503, which is distinguishable from
+    /// the shared-tap 503 by its message) or, with a pool available,
+    /// proceed into the restore. We assert the error body names the
+    /// netns pool, NOT forkd-tap0.
+    #[tokio::test]
+    async fn create_sandbox_n_gt_1_defaults_to_per_child_netns() {
+        let state = test_state_with_netns(0);
+        write_base_snapshot(&state, "base");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"snapshot_tag":"base","n":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(
+            err["error"].to_string().to_ascii_lowercase(),
+            std::string::String::new(),
+            "n>1 without per_child_netns must not hit the shared-tap guard; got: {}",
+            err["error"]
+        );
+        assert!(
+            !err["error"].to_string().contains("shared-TAP"),
+            "n=2 default must route to per-child netns, not the shared-tap n>1 rejection: {}",
+            err["error"]
+        );
+    }
+
+    /// S3-01 fan-out: an EXPLICIT `per_child_netns: false` with n>1
+    /// keeps the old 503 (the operator asked for the broken topology).
+    #[tokio::test]
+    async fn create_sandbox_explicit_shared_tap_n_gt_1_still_503() {
+        let state = test_state();
+        write_base_snapshot(&state, "base");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"snapshot_tag":"base","n":2,"per_child_netns":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            err["error"].to_string().contains("shared-TAP"),
+            "explicit per_child_netns=false with n>1 must stay 503 shared-TAP, got: {}",
+            err["error"]
         );
     }
 

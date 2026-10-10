@@ -250,7 +250,11 @@ pub fn volume_device_name(index: usize) -> Result<String> {
 /// file is removed. Hold the `Vm` for as long as you want the guest alive.
 #[derive(Debug)]
 pub struct Vm {
-    proc: Child,
+    /// The spawned firecracker process, when we own it as a child.
+    /// `None` for an ADOPTED VM (#301): the firecracker was spawned by a
+    /// previous controller instance, so it is not our child and Drop must
+    /// signal it by raw pid instead of `Child::kill()`.
+    proc: Option<Child>,
     pid: u32,
     sock: PathBuf,
     console: PathBuf,
@@ -1830,6 +1834,49 @@ fn spawn_firecracker_in(netns: Option<&str>, sock: &Path, console: &Path) -> Res
 // ---------------------------------------------------------------------------
 
 impl Vm {
+
+    /// Adopt an already-running Firecracker process (#301).
+    ///
+    /// After a controller restart the previous instance's children are
+    /// still alive but unowned: they are not our child processes, so
+    /// `Child::kill()` cannot reach them. This reconstructs a managing
+    /// `Vm` handle around the raw pid: the API socket is probed to prove
+    /// the process is a live, reachable Firecracker before the handle
+    /// is handed out, and Drop signals the pid directly (see `kill_raw`).
+    ///
+    /// `sock`/`console` are the paths the previous instance passed to
+    /// `spawn_firecracker_in` (recoverable from `/proc/<pid>/cmdline`).
+    /// `backing` should be the child's rootfs backing path if it had
+    /// one, so Drop reclaims it like a spawned child's.
+    ///
+    /// Fails if the socket does not exist or Firecracker does not answer
+    /// — an unadoptable process must be killed by the caller, not
+    /// silently managed.
+    pub fn adopt(
+        pid: u32,
+        sock: PathBuf,
+        console: PathBuf,
+        netns: Option<String>,
+        backing: Option<PathBuf>,
+    ) -> Result<Self> {
+        if !sock.exists() {
+            bail!("adopt: api socket {} does not exist", sock.display());
+        }
+        // Probe the daemon: a dead process's stale socket file must not
+        // be mistaken for a live VM.
+        api_request(&sock, "GET", "/vm/config", "", DEFAULT_API_TIMEOUT_SECS)?;
+        Ok(Self {
+            proc: None,
+            pid,
+            sock,
+            console,
+            netns,
+            cgroup: None,
+            memfd: None,
+            backing,
+        })
+    }
+
     /// Boot a fresh VM from kernel + rootfs.
     ///
     /// This blocks until Firecracker accepts `InstanceStart`. It does NOT
@@ -1939,7 +1986,7 @@ impl Vm {
         )?;
 
         Ok(Vm {
-            proc: proc.take(),
+            proc: Some(proc.take()),
             pid,
             sock,
             console,
@@ -2368,8 +2415,13 @@ impl Vm {
 
     /// Hard-kill the firecracker process.
     pub fn kill(&mut self) -> Result<()> {
-        let _ = self.proc.kill();
-        let _ = self.proc.wait();
+        match self.proc.take() {
+            Some(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            None => kill_raw(self.pid),
+        }
         let _ = std::fs::remove_file(&self.sock);
         Ok(())
     }
@@ -2377,8 +2429,15 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        let _ = self.proc.kill();
-        let _ = self.proc.wait();
+        match self.proc.take() {
+            Some(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Adopted VM (#301): not our child process, so Child::kill
+            // is unavailable. Signal by raw pid instead.
+            None => kill_raw(self.pid),
+        }
         let _ = std::fs::remove_file(&self.sock);
         if let Some(cg) = &self.cgroup {
             cgroup::cleanup(cg);
@@ -2388,6 +2447,21 @@ impl Drop for Vm {
         if let Some(backing) = self.backing.take() {
             let _ = std::fs::remove_file(&backing);
         }
+    }
+}
+
+/// Signal SIGKILL to a pid we do not own as a child (adopted VMs, #301).
+fn kill_raw(pid: u32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // SAFETY: kill(2) only; no memory of the target is touched.
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
 }
 
@@ -2477,7 +2551,7 @@ impl Snapshot {
                 Ok(proc) => {
                     let pid = proc.id();
                     children.push(Some(Vm {
-                        proc,
+                        proc: Some(proc),
                         pid,
                         sock,
                         console,
@@ -5083,3 +5157,57 @@ mod tests {
             .status();
     }
 }
+
+    // ------------------------------------------------------------------
+    // #301: adoption of an already-running Firecracker
+    // ------------------------------------------------------------------
+
+    /// `Vm::adopt` must refuse a socket that does not exist: a stale
+    /// registry row pointing at a cleaned-up work dir must not yield a
+    /// handle that looks managed while the process is gone (that would
+    /// defeat the fail-closed recovery contract).
+    #[test]
+    fn adopt_refuses_missing_socket() {
+        let tmp = std::env::temp_dir().join(format!("forkd-adopt-{}.d", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sock = tmp.join("child-1.sock");
+        let err = Vm::adopt(
+            424242,
+            sock.clone(),
+            tmp.join("child-1.console"),
+            None,
+            None,
+        )
+        .expect_err("adopt must fail when the api socket is missing");
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "error must name the missing socket: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `Vm::adopt` must refuse a socket whose backing process does not
+    /// answer `GET /vm/config`: a dead Firecracker leaves a stale socket
+    /// file behind, and adopting it would hand out a "managed" handle for
+    /// a dead VM. A socket with no listener must fail the probe.
+    #[test]
+    fn adopt_refuses_dead_socket_file() {
+        let tmp = std::env::temp_dir().join(format!("forkd-adopt2-{}.d", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sock = tmp.join("child-1.sock");
+        // A file at the socket path, but nobody listening on it: any
+        // connect() gets ECONNREFUSED.
+        std::fs::write(&sock, b"stale").unwrap();
+        let result = Vm::adopt(
+            424242,
+            sock.clone(),
+            tmp.join("child-1.console"),
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "adopt must fail when nothing answers on the socket"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }

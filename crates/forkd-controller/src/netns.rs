@@ -248,6 +248,13 @@ impl NetnsAllocator {
     pub fn release_index(&self, index: usize) {
         self.active.lock().remove(&index);
     }
+
+    /// Mark an index ACTIVE without a reservation round-trip. Used by
+    /// the #301 restart recovery: a re-adopted live VM already holds
+    /// `forkd-child-N`, so the index must not be handed to a new spawn.
+    pub fn adopt_active_index(&self, index: usize) {
+        self.active.lock().insert(index);
+    }
 }
 
 #[cfg(test)]

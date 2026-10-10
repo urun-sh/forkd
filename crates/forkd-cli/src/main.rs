@@ -3213,6 +3213,25 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
     }
 }
 
+
+/// Is a pid still alive? /proc on Linux, `kill -0` elsewhere (macOS
+/// dev boxes have no /proc).
+fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 /// Sweep the `<tag>.rootfs.ext4.prev-*` backups left beside a snapshot
 /// dir (review #295 approval follow-up, 2026-09-02).
 ///
@@ -3245,6 +3264,7 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
 /// accumulate. A backup whose pid is still alive belongs to a concurrent
 /// bake of this tag and is left alone. Ordering is by ctime (park time);
 /// the filename breaks ties so the choice never depends on readdir order.
+
 fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let live = snap_dir.join("rootfs.ext4");
@@ -3271,7 +3291,7 @@ fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Resu
             let name = entry.file_name().to_string_lossy().into_owned();
             let pid = name.strip_prefix(&prefix)?;
             if let Ok(pid) = pid.parse::<u32>() {
-                if pid != own_pid && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                if pid != own_pid && process_alive(pid) {
                     eprintln!(
                         "    note: leaving rootfs backup {} — pid {pid} is still running",
                         entry.path().display()

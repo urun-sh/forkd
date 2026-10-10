@@ -178,13 +178,53 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         tracing::info!(pruned, "reconciled stale sandbox entries on startup");
     }
 
-    // Kill orphaned Firecracker processes left over from a previous
-    // controller instance (issue #298). After reconcile() prunes
-    // dead-PID entries, any remaining entries have alive PIDs but no
-    // live_vms handle — they are unmanageable orphans. Kill them and
-    // prune the registry entries so the NetnsAllocator (empty active
-    // set) and shared_tap_owner (None) start clean.
-    let orphans = registry.kill_orphans()?;
+    // Recover sandbox rows orphaned by a previous controller instance
+    // (issues #298 + #301). After reconcile() prunes dead-PID entries,
+    // remaining entries have alive PIDs. Identity-verified rows are
+    // RE-ADOPTED first: a managing Vm handle is reconstructed from the
+    // live Firecracker's --api-sock so the sandbox survives the restart.
+    // Rows that cannot be adopted are killed and pruned so the
+    // NetnsAllocator (empty active set) and shared_tap_owner (None)
+    // never collide with an unmanaged VM.
+    //
+    // Adopted handles are stashed here and wired into AppState's
+    // live_vms immediately after it is constructed, before the HTTP
+    // listener accepts any request.
+    let adopted_vms: Vec<(String, forkd_vmm::Vm)> = Vec::new();
+    let adopted_sink = Mutex::new(adopted_vms);
+    let orphans = registry.recover_orphans(|cand| {
+        let Some(sock) = Registry::child_sock_from_cmdline(cand.pid) else {
+            return false;
+        };
+        let Some(work_dir) = sock.parent().map(|p| p.to_path_buf()) else {
+            return false;
+        };
+        // child-<n>.sock → child-<n>.console (firecracker's stdout
+        // sink lives beside its API socket).
+        let console = work_dir.join(format!(
+            "{}.console",
+            sock.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.trim_end_matches(".sock"))
+                .unwrap_or("child-1")
+        ));
+        let backing = Registry::child_backing_in(&work_dir);
+        match forkd_vmm::Vm::adopt(cand.pid, sock, console, cand.netns.clone(), backing) {
+            Ok(vm) => {
+                adopted_sink.lock().push((cand.id.clone(), vm));
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %cand.id,
+                    pid = cand.pid,
+                    error = %format!("{e:#}"),
+                    "adoption failed; falling back to kill"
+                );
+                false
+            }
+        }
+    })?;
     if orphans.killed > 0 {
         tracing::info!(
             killed = orphans.killed,
@@ -192,7 +232,7 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
             kill_failed = orphans.kill_failed,
             unresolved = orphans.unresolved,
             legacy_unverified = orphans.legacy_unverified,
-            "killed orphaned Firecracker processes on startup"
+            "killed unadoptable Firecracker processes on startup"
         );
     } else if orphans.pruned_stale > 0
         || orphans.kill_failed > 0
@@ -280,6 +320,44 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         #[cfg(test)]
         _tempdir: None,
     });
+
+    // #301: wire re-adopted sandboxes into the fresh AppState before
+    // the listener starts. The netns indices they hold must be ACTIVE
+    // in the allocator (a new spawn must not take `forkd-child-N` from
+    // a live VM), and a shared-tap adoptee owns the tap lease.
+    let adopted = adopted_sink.into_inner();
+    if !adopted.is_empty() {
+        {
+            let mut live = app_state.live_vms.lock();
+            for (id, vm) in adopted {
+                if let Some(ns) = vm.netns.as_deref().and_then(|n| n.strip_prefix("forkd-child-"))
+                {
+                    if let Ok(idx) = ns.parse::<usize>() {
+                        app_state.netns_alloc.adopt_active_index(idx);
+                    }
+                }
+                if vm.netns.is_none() {
+                    let mut owner = app_state.shared_tap_owner.lock();
+                    if owner.is_some() {
+                        // Two shared-tap adoptees cannot both hold the
+                        // single host tap; keep the first, drop the rest
+                        // (dropping the Vm kills it — same as the kill path).
+                        tracing::warn!(
+                            sandbox_id = %id,
+                            "second shared-tap adoptee; dropping (one tap, one owner)"
+                        );
+                        continue;
+                    }
+                    *owner = Some(id.clone());
+                }
+                live.insert(id, vm);
+            }
+        }
+        tracing::info!(
+            adopted = app_state.live_vms.lock().len(),
+            "adopted sandboxes re-attached after restart"
+        );
+    }
 
     let auth_layer_cfg = auth_cfg.clone();
     let audit_clone = audit.clone();

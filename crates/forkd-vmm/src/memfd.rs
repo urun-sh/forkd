@@ -36,7 +36,10 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_os = "linux"))]
 use anyhow::Result;
+#[cfg(target_os = "linux")]
+use anyhow::{Context, Result};
 
 // log2(2 MiB) = 21, shifted into the hugepage-size field per <linux/memfd.h>.
 #[cfg(target_os = "linux")]

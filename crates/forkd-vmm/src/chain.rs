@@ -527,6 +527,7 @@ mod tests {
     // --- Phase 1 unit tests (7/7): assemble correctness --------------
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn assemble_chain_memory_produces_correct_bytes() {
         let dir = make_base_and_diff("assemble", 0xAA, 0xBB);
         let base = snap_at(&dir.join("base.bin"), None, None);
@@ -550,6 +551,7 @@ mod tests {
         // remaining 8 KiB stays 0xAA.
         let bytes = std::fs::read(&out_path).unwrap();
         assert_eq!(bytes.len(), 16 * 1024);
+
         assert!(
             bytes[0..4096].iter().all(|&b| b == 0xAA),
             "first 4 KiB should be base (0xAA)"

@@ -981,6 +981,7 @@ pub fn eval_at(addr: &str, code: String) -> Result<serde_json::Value> {
 
 /// Same as `exec_at`, but enters `netns` first using setns(2).
 /// Required when each child lives in its own network namespace.
+#[cfg(target_os = "linux")]
 pub fn exec_in_netns(
     netns: &str,
     addr: String,
@@ -991,18 +992,41 @@ pub fn exec_in_netns(
 }
 
 /// Same as `eval_at`, but enters `netns` first.
+#[cfg(target_os = "linux")]
 pub fn eval_in_netns(netns: &str, addr: String, code: String) -> Result<serde_json::Value> {
     run_in_netns(netns, move || eval_at(&addr, code))
 }
 
 /// Same as `ping_at`, but enters `netns` first.
+#[cfg(target_os = "linux")]
 pub fn ping_in_netns(netns: &str, addr: String) -> Result<serde_json::Value> {
     run_in_netns(netns, move || ping_at(&addr))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn exec_in_netns(
+    _netns: &str,
+    _addr: String,
+    _args: Vec<String>,
+    _timeout: Duration,
+) -> Result<ExecResponse> {
+    bail!("exec_in_netns requires setns(2) (Linux only)")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn eval_in_netns(_netns: &str, _addr: String, _code: String) -> Result<serde_json::Value> {
+    bail!("eval_in_netns requires setns(2) (Linux only)")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn ping_in_netns(_netns: &str, _addr: String) -> Result<serde_json::Value> {
+    bail!("ping_in_netns requires setns(2) (Linux only)")
 }
 
 /// Run `f` in a dedicated thread that has joined network namespace `netns`
 /// via setns(2). The main thread's netns is never affected. Requires
 /// CAP_SYS_ADMIN (i.e. typically run via sudo).
+#[cfg(target_os = "linux")]
 fn run_in_netns<T, F>(netns: &str, f: F) -> Result<T>
 where
     T: Send + 'static,
@@ -2016,9 +2040,18 @@ impl RootfsDetour<'_> {
 
     fn go_home(&self) -> Result<()> {
         repoint_rootfs(&self.vm.sock, &self.home).map_err(|e| {
-            // SAFETY: kill(2) on a pid we spawned; no memory is touched.
+            // Fail closed: the child was killed rather than left to be
+            // resumed onto the snapshot's copy.
+            #[cfg(target_os = "linux")]
             unsafe {
+                // SAFETY: kill(2) on a pid we spawned; no memory is touched.
                 libc::kill(self.vm.pid as libc::pid_t, libc::SIGKILL);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &self.vm.pid.to_string()])
+                    .status();
             }
             e.context(format!(
                 "point rootfs back at the child's own backing {} — the child was killed \
@@ -2177,7 +2210,13 @@ impl Vm {
             vmstate,
             memory_diff,
             logical_size_bytes: meta.len(),
-            physical_size_bytes: meta.blocks() * 512,
+            #[cfg(target_os = "linux")]
+            physical_size_bytes: {
+                use std::os::unix::fs::MetadataExt;
+                meta.blocks() * 512
+            },
+            #[cfg(not(target_os = "linux"))]
+            physical_size_bytes: meta.len(),
             volumes,
         })
     }
@@ -2974,7 +3013,13 @@ mod tests {
     }
 
     fn proc_exists(pid: u32) -> bool {
-        Path::new(&format!("/proc/{pid}")).exists()
+        // `kill -0` is the portable liveness probe (macOS has no /proc).
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     /// A boot that fails after Firecracker is up must reap it. Before the
@@ -3287,6 +3332,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn vmstate_only_placeholder_is_unwriteable() {
         // Defense-in-depth: if FC ever forgets the VmstateOnly guard and
         // opens the placeholder, the path must fail open(2) loudly

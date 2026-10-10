@@ -769,10 +769,16 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pid_alive(_pid: u32) -> bool {
-    // Off-Linux (dev box on macOS / Windows): conservatively assume alive
-    // so reconcile doesn't wipe state during local builds.
-    true
+fn pid_alive(pid: u32) -> bool {
+    // Off-Linux (macOS dev box): no /proc, so probe with `kill -0`.
+    // Conservative direction preserved: if the probe itself fails to
+    // run, report alive so reconcile doesn't wipe state on a weird box.
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
 }
 
 // ----------------------------------------------------------------

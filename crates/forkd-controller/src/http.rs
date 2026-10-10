@@ -2765,6 +2765,7 @@ fn run_live_branch_setup(
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn preallocate_memory_file(path: &std::path::Path, size: u64) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
@@ -2785,6 +2786,21 @@ fn preallocate_memory_file(path: &std::path::Path, size: u64) -> anyhow::Result<
         let err = std::io::Error::from_raw_os_error(rc);
         anyhow::bail!("posix_fallocate({size}): {err}");
     }
+    Ok(())
+}
+
+/// Non-Linux: no posix_fallocate; a plain truncate is the closest
+/// portable equivalent (still sparse, but reserves the length).
+#[cfg(not(target_os = "linux"))]
+fn preallocate_memory_file(path: &std::path::Path, size: u64) -> anyhow::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open for preallocate: {}", path.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("set_len({size}) on {}", path.display()))?;
     Ok(())
 }
 

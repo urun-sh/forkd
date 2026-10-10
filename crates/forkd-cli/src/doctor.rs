@@ -1005,16 +1005,19 @@ fn probe_guest_port(netns: &str, addr: &str) -> anyhow::Result<bool> {
     }
     // Connect from inside the netns. `timeout` caps the kernel's SYN
     // retry window (~2 min without it) at 3 s per attempt so the
-    // gate's 10 s deadline is real; the address is passed as a
-    // positional parameter, never interpolated into the shell text.
+    // gate's 10 s deadline is real. `addr` is a parse-validated
+    // SocketAddr, so the /dev/tcp/HOST/PORT text built from it cannot
+    // smuggle shell metacharacters.
+    let probe_text = format!(
+        "exec 3<>/dev/tcp/{} && echo connected",
+        addr.replace(':', "/")
+    );
     let out = Command::new("timeout")
         .arg("3")
         .args(["ip", "netns", "exec", netns])
         .arg("bash")
         .arg("-c")
-        .arg("exec 3<>/dev/tcp/$1 && echo connected")
-        .arg("--")
-        .arg(addr)
+        .arg(probe_text)
         .output();
     match out {
         Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("connected") => {

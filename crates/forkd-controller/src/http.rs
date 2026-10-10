@@ -1215,6 +1215,10 @@ async fn create_sandbox(
     let spawn_n = req.n;
     let spawn_per_child_netns = req.per_child_netns;
     let spawn_mem_limit = req.memory_limit_mib;
+    let spawn_quota = forkd_vmm::cgroup::ChildQuota {
+        cpu_max: req.cpu_max.clone(),
+        pids_max: req.pids_max,
+    };
     let spawn_live_fork = req.live_fork;
     let spawn_hugepages = req.hugepages;
     let tag_for_work_dir = tag.clone();
@@ -1341,6 +1345,7 @@ async fn create_sandbox(
             n: spawn_n,
             per_child_netns: spawn_per_child_netns,
             memory_limit_mib: spawn_mem_limit,
+            quota: spawn_quota,
             netns_offset,
             prewarm_scratch_dir,
             // Phase 6 unstable: live_fork=true opts the sandbox into
@@ -2968,6 +2973,7 @@ fn spawn_one_for_workspace(
     snapshot_tag: &str,
     per_child_netns: bool,
     memory_limit_mib: Option<u64>,
+    quota: forkd_vmm::cgroup::ChildQuota,
 ) -> anyhow::Result<(
     forkd_vmm::Vm,
     SandboxInfo,
@@ -3030,6 +3036,7 @@ fn spawn_one_for_workspace(
         n: 1,
         per_child_netns,
         memory_limit_mib,
+        quota,
         netns_offset,
         prewarm_scratch_dir: None,
         memory_backend: forkd_vmm::MemoryBackend::File,
@@ -3103,9 +3110,13 @@ async fn create_workspace(
     let snapshot_tag = req.snapshot_tag.clone();
     let per_child_netns = req.per_child_netns;
     let memory_limit_mib = req.memory_limit_mib;
+    let quota = forkd_vmm::cgroup::ChildQuota {
+        cpu_max: req.cpu_max.clone(),
+        pids_max: req.pids_max,
+    };
     let s_clone = s.clone();
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &snapshot_tag, per_child_netns, memory_limit_mib)
+        spawn_one_for_workspace(&s_clone, &snapshot_tag, per_child_netns, memory_limit_mib, quota)
     })
     .await;
 
@@ -3431,7 +3442,7 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
     // which collides when several workspaces are active.
     let per_child_netns = ws.per_child_netns;
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None)
+        spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None, Default::default())
     })
     .await;
     let (vm, sb_info, mut netns_reservation, mut tap_claim) = match spawn_result {

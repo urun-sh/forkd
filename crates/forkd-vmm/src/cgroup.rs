@@ -95,12 +95,29 @@ pub fn ensure_parent() -> Result<PathBuf> {
     Ok(parent)
 }
 
+/// Per-child resource limits besides memory (#159). All optional; any
+/// `None` field is simply not written, preserving prior behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildQuota {
+    /// `cpu.max` value: `"<quota> <period>"` in microseconds, e.g.
+    /// `"200000 100000"` = 2 CPUs. `Some("max 100000")` for unlimited.
+    pub cpu_max: Option<String>,
+    /// `pids.max` value, e.g. `Some(512)`. Caps the process/thread count
+    /// inside the child cgroup (firecracker + its threads).
+    pub pids_max: Option<u64>,
+}
+
 /// Place a child VM's Firecracker process under
-/// `/sys/fs/cgroup/forkd/<name>/` with the given memory limit.
+/// `/sys/fs/cgroup/forkd/<name>/` with the given limits.
 ///
 /// Returns the path of the child cgroup so the caller can `cleanup` it
 /// when the VM dies.
-pub fn place_child(name: &str, pid: u32, memory_max_bytes: u64) -> Result<PathBuf> {
+pub fn place_child(
+    name: &str,
+    pid: u32,
+    memory_max_bytes: u64,
+    quota: ChildQuota,
+) -> Result<PathBuf> {
     let parent = ensure_parent()?;
     let child = parent.join(name);
     if !child.exists() {
@@ -108,6 +125,14 @@ pub fn place_child(name: &str, pid: u32, memory_max_bytes: u64) -> Result<PathBu
     }
     std::fs::write(child.join("memory.max"), memory_max_bytes.to_string())
         .with_context(|| format!("set memory.max on {}", child.display()))?;
+    if let Some(cpu_max) = &quota.cpu_max {
+        std::fs::write(child.join("cpu.max"), cpu_max)
+            .with_context(|| format!("set cpu.max on {}", child.display()))?;
+    }
+    if let Some(pids_max) = quota.pids_max {
+        std::fs::write(child.join("pids.max"), pids_max.to_string())
+            .with_context(|| format!("set pids.max on {}", child.display()))?;
+    }
     std::fs::write(child.join("cgroup.procs"), pid.to_string())
         .with_context(|| format!("attach pid {pid} to {}", child.display()))?;
     Ok(child)
@@ -138,5 +163,22 @@ mod tests {
         // 1 << 53 MiB → would overflow u64 if multiplied, must saturate
         let huge = u64::MAX / 1024;
         let _ = mib_to_bytes(huge); // doesn't panic
+    }
+
+    #[test]
+    fn child_quota_defaults_write_nothing_extra() {
+        let q = ChildQuota::default();
+        assert_eq!(q.cpu_max, None);
+        assert_eq!(q.pids_max, None);
+    }
+
+    #[test]
+    fn child_quota_holds_values() {
+        let q = ChildQuota {
+            cpu_max: Some("200000 100000".into()),
+            pids_max: Some(512),
+        };
+        assert_eq!(q.cpu_max.as_deref(), Some("200000 100000"));
+        assert_eq!(q.pids_max, Some(512));
     }
 }

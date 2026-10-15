@@ -38,7 +38,8 @@ use crate::api::{
     ExecResponse, SandboxInfo, SnapshotInfo, SnapshotInfoDetail, SuspendWorkspaceRequest,
     VersionResponse, WorkspaceInfo, WorkspaceStatus,
 };
-use crate::state::Registry;
+use crate::state::{read_proc_starttime, registration_boot_id, Registry};
+use forkd_vmm::ClockSyncOutcome;
 
 const API_VERSION: &str = "v1";
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -91,6 +92,11 @@ pub struct AppState {
     /// sandbox and workspace spawn paths so concurrent spawns never
     /// pick overlapping offsets (security review #282).
     pub netns_alloc: std::sync::Arc<crate::netns::NetnsAllocator>,
+    /// Monotonic count of pre-restore orphan scans that found firecracker
+    /// processes not tracked by `live_vms`. Exposed via `/metrics` as
+    /// `forkd_orphan_firecrackers_detected_total` so operators can alert
+    /// on the tap/netns/fd-collision precursor instead of relying on logs.
+    pub orphan_firecrackers_detected: std::sync::atomic::AtomicU64,
     /// Scratch directory used for prewarm throwaway snapshots when
     /// `CreateSandboxRequest::prewarm` is set. Mirror of
     /// `DaemonConfig::prewarm_scratch_dir`.
@@ -242,6 +248,9 @@ async fn metrics(State(s): State<SharedState>) -> impl IntoResponse {
     let (snap_count, sb_count) = s.registry.counts();
     let branches_in_flight = s.branch_in_flight.lock().len();
     let branch_cap = s.branch_concurrency_cap;
+    let orphans = s
+        .orphan_firecrackers_detected
+        .load(std::sync::atomic::Ordering::Relaxed);
     // Prometheus text format. Keep names stable — exporters depend on them.
     let body = format!(
         "# HELP forkd_snapshots_total Number of snapshots known to the controller.\n\
@@ -256,6 +265,9 @@ async fn metrics(State(s): State<SharedState>) -> impl IntoResponse {
          # HELP forkd_branch_concurrency_cap Configured maximum concurrent BRANCH operations.\n\
          # TYPE forkd_branch_concurrency_cap gauge\n\
          forkd_branch_concurrency_cap {branch_cap}\n\
+         # HELP forkd_orphan_firecrackers_detected_total Cumulative firecracker orphans detected.\n\
+         # TYPE forkd_orphan_firecrackers_detected_total counter\n\
+         forkd_orphan_firecrackers_detected_total {orphans}\n\
          # HELP forkd_build_info Build version of the controller binary.\n\
          # TYPE forkd_build_info gauge\n\
          forkd_build_info{{version=\"{BUILD_VERSION}\"}} 1\n"
@@ -311,6 +323,44 @@ async fn list_snapshots(State(s): State<SharedState>) -> impl IntoResponse {
         }
     }
     Json(snapshots)
+}
+
+/// #301: scan for orphaned firecracker processes before a restore. An
+/// orphan is a firecracker PID on the host that is NOT tracked by
+/// `live_vms` — leftovers from a prior (crashed) run that may hold tap
+/// devices, netns slots, or fd budget and doom a new restore to
+/// socket/restore failures. Best-effort, read-only: it never kills.
+/// The lock is held only long enough to snapshot the known-PID set;
+/// the `/proc` scan + logging run after the lock is released so the
+/// scan doesn't serialize concurrent sandbox operations.
+fn warn_orphan_firecrackers(s: &SharedState, tag: &str) {
+    // Collect known PIDs under a short-lived guard, then drop the lock
+    // before the blocking `/proc` readdir + per-PID reads.
+    let known: std::collections::HashSet<u32> = {
+        let live = s.live_vms.lock();
+        live.values().map(|vm| vm.pid()).collect()
+    };
+    let orphans = forkd_vmm::scan_firecracker_orphans(&known);
+    if orphans.is_empty() {
+        return;
+    }
+    s.orphan_firecrackers_detected
+        .fetch_add(orphans.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        tag = %tag,
+        count = orphans.len(),
+        pids = ?orphans.iter().map(|o| o.pid).collect::<Vec<_>>(),
+        "orphaned firecracker processes detected before restore; \
+         these may hold tap/netns resources and cause spawn failures"
+    );
+    for o in &orphans {
+        tracing::warn!(
+            pid = o.pid,
+            elapsed_secs = o.elapsed_secs,
+            cmdline = %o.cmdline,
+            "orphaned firecracker process"
+        );
+    }
 }
 
 /// Phase 6.4: lazy reaper. Walks `AppState::live_in_flight`, joins
@@ -1220,9 +1270,26 @@ async fn create_sandbox(
     // The kernel usually clears state within tens of milliseconds. Retry
     // up to 3 times with 50/200/800 ms backoff. ForkOpts and Snapshot are
     // Clone so we can hand a fresh copy to each attempt.
+    // Boot identity for sandbox registration (review #299): read it
+    // BEFORE any VM work so an environment where boot_id is unreadable
+    // fails the spawn loudly here instead of recording a silently-
+    // unverifiable row that would abort every future controller start.
+    let reg_boot_id = match registration_boot_id() {
+        Ok(b) => b,
+        Err(e) => return server_error(&format!("{e:#}")),
+    };
     let prewarm_requested = req.prewarm;
     let mut snapshot = snapshot;
     let head_tag_for_log = req.snapshot_tag.clone();
+    // #301: surface orphaned firecracker processes before the restore.
+    // The helper scopes the live_vms lock to just PID collection and
+    // runs the /proc scan + logging after the lock is released.
+    //
+    // Limitation: this scan is point-in-time and does NOT guarantee that
+    // no orphan appears between the scan and the restore. It is a
+    // diagnostic aid, not a gate. Issue #301 remains open for the
+    // lifecycle-level orphan reap/gate work.
+    warn_orphan_firecrackers(&s, &head_tag_for_log);
     let tap_token_for_closure = tap_token.clone();
     let (fork_result, mut netns_reservation, mut tap_claim) = match tokio::task::spawn_blocking(move || -> anyhow::Result<(forkd_vmm::ForkResult, Option<crate::netns::NetnsReservation>, Option<SharedTapClaim>)> {
         // Reserve the netns offset range INSIDE the blocking task so
@@ -1280,6 +1347,13 @@ async fn create_sandbox(
             // snapshots (see docs/design/diff-snapshots.md). The cost is
             // ~1 bit per page; negligible.
             enable_diff_snapshots: true,
+            sync_guest_clocks: true,
+            // Under spawn bursts (warm-pool refill) the default 10s socket
+            // wait can be too tight when prior-VM tap/netns teardown races
+            // with new firecracker spawns. Give the daemon path a more
+            // generous budget so a single slow child doesn't fail the batch.
+            socket_wait_timeout_secs: daemon_socket_wait_timeout_secs(),
+
         };
         // Per-snapshot-tag work_dir would clash if two batches of the same tag
         // ran concurrently (e.g. two branches of the same source). Mix the
@@ -1332,25 +1406,88 @@ async fn create_sandbox(
         }
 
         let backoffs_ms = [50u64, 200, 800];
+        // Tracks the most recent busy failure across retries. On the final
+        // attempt the loop falls through (rather than returning early) so
+        // the exhausted-retry error carries retry-exhaustion context into
+        // the API response/log — operators can then distinguish a transient
+        // contention storm from a permanent failure.
+        let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..=backoffs_ms.len() {
             if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(backoffs_ms[attempt - 1]));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    backoffs_ms[attempt - 1],
+                ));
             }
+            let final_attempt = attempt == backoffs_ms.len();
             match snapshot.restore_many_with(opts.clone(), &work_dir) {
-                Ok(r) => return Ok((r, netns_reservation, tap_claim)),
+                Ok(r) if r.failures.is_empty() => return Ok((r, netns_reservation, tap_claim)),
+                Ok(r) => {
+                    // Partial success: some children restored, some failed.
+                    // A sandbox needs all `n` children, so drop the partial
+                    // set (kills their firecracker processes) and retry the
+                    // whole batch when the failure is retryable (busy);
+                    // otherwise surface the structured per-child failures.
+                    //
+                    // Controller-level all-or-nothing: a sandbox requires
+                    // all N children, so partial success is NOT exposed to
+                    // the API caller. The per-child failure reporting from
+                    // restore_many_with is used here for diagnostics and
+                    // retry classification only. See issue #301 for the
+                    // broader partial-success-through-controller work.
+                    let forkd_vmm::ForkResult {
+                        children,
+                        failures,
+                        ..
+                    } = r;
+                    let is_busy = failures.iter().any(|f| {
+                        f.error.contains("Resource busy")
+                            || f.error.contains("Device or resource busy")
+                            || f.error.contains("os error 16")
+                    });
+                    let err = anyhow::Error::new(forkd_vmm::RestoreError { failures });
+                    drop(children);
+                    if !is_busy {
+                        return Err(err);
+                    }
+                    if final_attempt {
+                        last_err =
+                            Some(err.context("restore_many: exhausted all busy-retries"));
+                    } else {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            next_backoff_ms = backoffs_ms[attempt],
+                            error = %err,
+                            "restore_many: partial restore (tap/cgroup busy), retrying"
+                        );
+                        last_err = Some(err);
+                    }
+                }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     let is_busy = msg.contains("Resource busy")
                         || msg.contains("Device or resource busy")
                         || msg.contains("os error 16");
-                    if !is_busy || attempt == backoffs_ms.len() {
+                    if !is_busy {
                         return Err(e);
-
                     }
+                    if final_attempt {
+                        last_err =
+                            Some(e.context("restore_many: exhausted all busy-retries"));
+                    } else {
+                        last_err = Some(e);
+                    }
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        next_backoff_ms = backoffs_ms[attempt],
+                        error = %msg,
+                        "restore_many: tap/cgroup busy, retrying"
+                    );
                 }
             }
         }
-        unreachable!("retry loop must return on final attempt")
+        // All busy-retries exhausted; surface the final error (carrying
+        // retry-exhaustion context) for the API response/log.
+        Err(last_err.expect("busy-retry loop exhausted without capturing an error"))
     })
     .await
     {
@@ -1365,12 +1502,24 @@ async fn create_sandbox(
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
     if prewarm_requested {
+        let clock_failures: Vec<String> = fork_result
+            .clock_sync_outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ClockSyncOutcome::Failed { child_index, error } => {
+                    Some(format!("child {child_index}: {error}"))
+                }
+                _ => None,
+            })
+            .collect();
         tracing::info!(
             tag = %tag,
             n = fork_result.children.len(),
             spawn_ms = fork_result.spawn_ms as u64,
             restore_ms = fork_result.restore_ms as u64,
             prewarm_ms = fork_result.prewarm_ms as u64,
+            clock_sync_ms = fork_result.clock_sync_ms as u64,
+            clock_sync_failures =? clock_failures,
             "sandbox created (prewarmed)"
         );
     }
@@ -1380,7 +1529,12 @@ async fn create_sandbox(
     let mut first_id_override = tap_token.clone();
     {
         let mut live = s.live_vms.lock();
-        for vm in fork_result.children {
+        for fc in fork_result.children {
+            let vm = fc.vm;
+            // Shared-tap ownership (review #281): the first child's
+            // sandbox id is the tap-lease token; release_shared_tap_if_owner
+            // checks against it on teardown. For non-shared-tap spawns
+            // first_id_override is None so every child gets a fresh id.
             let id = first_id_override.take().unwrap_or_else(new_sandbox_id);
             let info = SandboxInfo {
                 id: id.clone(),
@@ -1392,6 +1546,8 @@ async fn create_sandbox(
                 guest_addr: "10.42.0.2:8888".to_string(),
                 created_at_unix: now,
                 pid: Some(vm.pid()),
+                proc_starttime: read_proc_starttime(vm.pid()),
+                boot_id: reg_boot_id.clone(),
                 memory_limit_mib: req.memory_limit_mib,
                 has_branched: false,
                 last_branch_memory_path: None,
@@ -2226,6 +2382,20 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// #301: per-child firecracker socket-wait timeout for daemon-spawned
+/// sandboxes, in seconds. Under warm-pool refill bursts the historical
+/// 10s budget can be too tight when prior-VM tap/netns teardown races
+/// with new firecracker spawns. Operators can override via
+/// `FORKD_SOCKET_WAIT_TIMEOUT_SECS`; the default (30) gives a single
+/// slow child more room before the batch fails.
+fn daemon_socket_wait_timeout_secs() -> u64 {
+    std::env::var("FORKD_SOCKET_WAIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(30)
+}
+
 fn branch_suffix() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static SEQ: AtomicU16 = AtomicU16::new(0);
@@ -2746,6 +2916,10 @@ fn spawn_one_for_workspace(
     Option<crate::netns::NetnsReservation>,
     Option<SharedTapClaim>,
 )> {
+    // Boot identity for registration (review #299): fail the spawn
+    // loudly if boot_id is unreadable rather than recording a row that
+    // can never pass startup identity verification.
+    let reg_boot_id = registration_boot_id()?;
     let snap_dir: PathBuf = match s.registry.get_snapshot(snapshot_tag) {
         Some(s) => PathBuf::from(&s.dir),
         None => s.snapshot_root.join(snapshot_tag),
@@ -2802,14 +2976,26 @@ fn spawn_one_for_workspace(
         prewarm_scratch_dir: None,
         memory_backend: forkd_vmm::MemoryBackend::File,
         enable_diff_snapshots: true,
+        sync_guest_clocks: true,
+        socket_wait_timeout_secs: daemon_socket_wait_timeout_secs(),
     };
     let work_dir =
         std::env::temp_dir().join(format!("forkd-workspace-{snapshot_tag}-o{netns_offset}"));
+    // #301: surface orphaned firecracker processes before the restore.
+    warn_orphan_firecrackers(s, snapshot_tag);
     let mut fork_result = snapshot.restore_many_with(opts, &work_dir)?;
-    let vm = fork_result
-        .children
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("restore_many returned no children"))?;
+    let vm = fork_result.children.pop().map(|fc| fc.vm).ok_or_else(|| {
+        if let Some(first) = fork_result.failures.first() {
+            anyhow::anyhow!(
+                "restore_many child {} failed ({:?}): {}",
+                first.child_index,
+                first.phase,
+                first.error
+            )
+        } else {
+            anyhow::anyhow!("restore_many returned no children")
+        }
+    })?;
 
     let info = SandboxInfo {
         id: sandbox_id,
@@ -2818,6 +3004,8 @@ fn spawn_one_for_workspace(
         guest_addr: "10.42.0.2:8888".to_string(),
         created_at_unix: unix_now(),
         pid: Some(vm.pid()),
+        proc_starttime: read_proc_starttime(vm.pid()),
+        boot_id: reg_boot_id,
         memory_limit_mib,
         has_branched: false,
         last_branch_memory_path: None,
@@ -3251,6 +3439,7 @@ mod tests {
                 Box::new(crate::netns::RangeProbe { max: 256 }),
             ),
             shared_tap_owner: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            orphan_firecrackers_detected: std::sync::atomic::AtomicU64::new(0),
             prewarm_scratch_dir,
             #[cfg(target_os = "linux")]
             live_in_flight: Mutex::new(HashMap::new()),
@@ -3280,6 +3469,7 @@ mod tests {
                 Box::new(crate::netns::RangeProbe { max: netns_pool }),
             ),
             shared_tap_owner: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            orphan_firecrackers_detected: std::sync::atomic::AtomicU64::new(0),
             prewarm_scratch_dir,
             #[cfg(target_os = "linux")]
             live_in_flight: Mutex::new(HashMap::new()),
@@ -3434,6 +3624,8 @@ mod tests {
             guest_addr: "10.42.0.2:8888".to_string(),
             created_at_unix: unix_now(),
             pid: None,
+            proc_starttime: None,
+            boot_id: None,
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -4478,6 +4670,8 @@ mod tests {
                 guest_addr: "127.0.0.1:1".into(),
                 created_at_unix: 1,
                 pid: Some(99999999),
+                proc_starttime: None,
+                boot_id: None,
                 memory_limit_mib: None,
                 has_branched: false,
                 last_branch_memory_path: None,

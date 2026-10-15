@@ -6,6 +6,104 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased
 
+### Reflink copies actually reflink
+
+`chain::reflink_copy` passed `0x40209409` as `FICLONE`; the real number is
+`_IOW(0x94, 9, int)` = `0x40049409`. The kernel answered the wrong value with
+`ENOTTY`, which the helper treats as "filesystem has no reflink", so every
+chain-assembly base copy and the bake's rootfs baseline clone streamed a full
+copy even on btrfs, XFS, and ZFS 2.2+. Found by @jrimmer in #321.
+
+### Upgrade note: legacy sandbox rows block startup
+
+The controller now persists a boot identity (start time + boot id) for every
+sandbox it registers and, on startup, refuses to kill an orphaned Firecracker
+process whose identity it cannot verify — including rows written by an older
+forkd, which carry no boot identity. If you upgrade while sandboxes are live,
+the controller will abort startup with a `legacy registry row` diagnostic
+instead of risking a kill against an unverified PID. Kill the recorded PIDs
+manually (or remove the entries from `state.json` after confirming the
+processes are dead) before restarting; every sandbox spawned by the new
+version persists full identity, so this recurs only for pre-upgrade rows.
+Spawns are now also rejected up front if the boot id cannot be read, rather
+than registering a sandbox that could never be verified later.
+
+### Safe re-snapshot of existing tags
+
+Re-running `forkd snapshot` on an existing tag no longer risks destroying
+the last usable snapshot (#296 follow-up, review #295). The previously
+published rootfs is renamed aside (`<tag>.rootfs.ext4.prev-<pid>`) before
+the fresh baseline is cloned and booted; any failure — boot timeout,
+snapshot error, publish error, interrupt — restores it automatically and
+drops the partial clone. The backup is deleted only after the new
+snapshot is fully published, so a tag always holds a consistent
+(rootfs, vmstate, memory.bin, snapshot.json) set. Also fixes a
+src == dst guard comment duplication and makes the chain-unpack tail
+bail instead of resolving an empty path.
+
+A later `snapshot` run on that tag now sweeps every
+`<tag>.rootfs.ext4.prev-*` file instead of only the one named for its own
+pid. The backup name is pid-scoped, so a `kill -9` landing between the
+preserve-rename and the publish stranded the file under a pid no
+subsequent run would look for, while the tag was left with no
+`rootfs.ext4` — or with an unpublished, dirtied clone at that path — under
+the old metadata. Unless the tag was republished after the backup was
+parked (`snapshot.json` newer than the park), the newest backup is now
+renamed back into place; the rest are discarded, except a backup whose
+pid is still running a bake.
+
+### Bakes refuse to start on a nearly full disk, and clean up after themselves
+
+Running out of space mid-write does not fail cleanly — it leaves a
+*corrupt* artifact: a rootfs whose package files contain other files'
+bytes, or a truncated `memory.bin`. Inside a guest that surfaces much
+later as `uname: option requires an argument`, `Exec format error`, or
+`EBADMSG` on a `/var/lib/dpkg` entry, which reads like a broken build
+rather than a broken image. `forkd parent build` (conversion) and
+`forkd snapshot` now check free space on the target filesystem first and
+refuse with an explicit error below a 5 GiB reserve
+(`FORKD_MIN_FREE_GIB` to override). The check is advisory: if `statvfs`
+cannot run, it warns and continues rather than blocking work on a broken
+measurement.
+
+`forkd snapshot` also removes its staging dir on every exit now, not only
+on success. A failure after the volatile artifacts were written — boot
+timeout, snapshot error, publish error, interrupt — used to leave a fully
+written `memory.bin` (GBs) beside the snapshot dir that nothing ever
+collected.
+
+### A failed boot no longer orphans its Firecracker process
+
+`Vm::boot` spawned Firecracker and then issued the `/boot-source`,
+`/drives/rootfs`, `/entropy` and `/actions` calls with a bare
+`std::process::Child` in hand. `Child` has no kill-on-drop, so any `?` in
+that window — including `wait_for_sock` timing out — returned an error and
+abandoned a *live* Firecracker. The orphan holds the sandbox's tap device
+and rootfs fd, and the tap name is frozen into the vmstate, so every later
+spawn of that snapshot dies inside Firecracker with `Open tap device
+failed` before it can create its API socket; callers see
+`socket .../child-N.sock never appeared` and the snapshot stays unusable
+until the orphan is killed by hand. The child is now owned by a
+`PendingFirecracker` guard that reaps it on every early return and hands
+it over to the `Vm` only on success.
+
+### Rootfs sidecar placement: recorded absolute path, validated
+
+Packs record the rootfs sidecar's target as the vmstate-frozen ABSOLUTE
+path again (`manifest.rootfs.target_path`), and `unpack`/`pull` place it
+exactly there after validating it sits inside a forkd-managed root (the
+forkd data dir, its `snapshots/` tree, or the rootfs cache
+`/var/cache/forkd` / `$FORKD_RUN_CACHE`). This restores cross-host
+pack/pull behavior for packs built from cache-path bakes and keeps
+unpacking under a different `--tag` or data dir restorable (the previous
+snap-dir-relative placement put the rootfs where the vmstate wasn't
+looking). Paths outside the managed roots — including the brief
+relative-path pack format from development builds — are rejected
+fail-closed, so a malicious pack still cannot aim a privileged unpack at
+arbitrary filesystem locations. A missing or unfetchable sidecar is now
+a hard error instead of a warning, since the resulting snapshot could
+never be restored. See docs/HUB.md ("Rootfs sidecar").
+
 ### Audit-log rotation
 
 The controller now reopens its audit log on `SIGHUP`, with reopen and request

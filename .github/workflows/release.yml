@@ -39,12 +39,25 @@ jobs:
   binaries:
     name: build binaries (x86_64-linux)
     runs-on: ubuntu-latest
+    # BUILD AGAINST THE OLDEST SUPPORTED GLIBC (jammy = 2.35): the sandbox
+    # host VMs run Ubuntu 22.04, and a binary linked against ubuntu-latest's
+    # glibc (2.39) dies on the host with `GLIBC_2.38 not found` (live
+    # refusal: urun dev-usw2 2026-10-15, forkd-controller crash-looped at
+    # boot stage forkd-daemon, restart counter 49). The container keeps
+    # everything else about the build identical.
+    container:
+      image: ubuntu:22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps (jammy container)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential curl ca-certificates
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: cargo build --release --workspace
         run: cargo build --release --workspace

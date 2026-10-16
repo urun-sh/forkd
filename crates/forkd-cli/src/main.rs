@@ -556,6 +556,26 @@ enum Cmd {
         /// Bearer token for the controller daemon (matches `--token-file`).
         #[arg(long, env = "FORKD_TOKEN", hide_env_values = true)]
         daemon_token: Option<String>,
+        /// Emit one JSON object ({"ready":bool,"checks":[...]}) and use
+        /// the exit code as the gate. For readiness probes / CI.
+        #[arg(long)]
+        json: bool,
+        /// Pin the firecracker version for this pool (snapshot-family
+        /// rule). Any mismatch FAILs, even a newer version.
+        #[arg(long)]
+        expected_fc_version: Option<String>,
+        /// Minimum provisioned forkd-child-* netns (fan-out >1 needs
+        /// one per concurrent child). Fewer FAILs.
+        #[arg(long)]
+        min_netns: Option<usize>,
+        /// REST-spawn one sandbox from this snapshot tag (per-child
+        /// netns), then delete it. Proves restore+fork e2e.
+        #[arg(long)]
+        smoke_tag: Option<String>,
+        /// Guest port to TCP-probe after the smoke spawn (e.g. 49983
+        /// for envd). Implies --smoke-tag is set.
+        #[arg(long, requires = "smoke_tag")]
+        smoke_port: Option<u16>,
     },
     /// Quick latency probe against a live daemon. Runs a representative
     /// spawn → exec → branch (diff=true) → fanout → cleanup cycle and
@@ -996,7 +1016,22 @@ fn main() -> Result<()> {
         Cmd::Doctor {
             daemon_url,
             daemon_token,
-        } => doctor::run(&daemon_url, daemon_token),
+            json,
+            expected_fc_version,
+            min_netns,
+            smoke_tag,
+            smoke_port,
+        } => doctor::run_with(
+            doctor::DoctorOpts {
+                json,
+                expected_fc_version,
+                min_netns,
+                smoke_tag,
+                smoke_port,
+            },
+            &daemon_url,
+            daemon_token,
+        ),
         Cmd::Bench {
             tag,
             n,
@@ -2601,11 +2636,13 @@ fn run_cmd(
                 n: 1,
                 per_child_netns: false,
                 memory_limit_mib: None,
+                quota: forkd_vmm::cgroup::ChildQuota::default(),
                 netns_offset: 0,
                 prewarm_scratch_dir: None,
                 memory_backend: forkd_vmm::MemoryBackend::File,
                 enable_diff_snapshots: false,
                 sync_guest_clocks: false,
+                clock_sync_timeout_secs: forkd_vmm::DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
                 socket_wait_timeout_secs: forkd_vmm::DEFAULT_SOCKET_WAIT_SECS,
             },
             &work_dir,
@@ -3212,6 +3249,24 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
     }
 }
 
+/// Is a pid still alive? /proc on Linux, `kill -0` elsewhere (macOS
+/// dev boxes have no /proc).
+fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 /// Sweep the `<tag>.rootfs.ext4.prev-*` backups left beside a snapshot
 /// dir (review #295 approval follow-up, 2026-09-02).
 ///
@@ -3270,7 +3325,7 @@ fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Resu
             let name = entry.file_name().to_string_lossy().into_owned();
             let pid = name.strip_prefix(&prefix)?;
             if let Ok(pid) = pid.parse::<u32>() {
-                if pid != own_pid && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                if pid != own_pid && process_alive(pid) {
                     eprintln!(
                         "    note: leaving rootfs backup {} — pid {pid} is still running",
                         entry.path().display()
@@ -4002,6 +4057,7 @@ fn fork_cmd(
                 n,
                 per_child_netns,
                 memory_limit_mib,
+                quota: forkd_vmm::cgroup::ChildQuota::default(),
                 // CLI `forkd fork` is one-shot: it always allocates starting
                 // from forkd-child-1. The daemon path picks a non-colliding
                 // offset based on live state; the CLI doesn't have that view.
@@ -4023,6 +4079,7 @@ fn fork_cmd(
                 // CLI fork doesn't outlive its invocation, no diff snapshots.
                 enable_diff_snapshots: false,
                 sync_guest_clocks: false,
+                clock_sync_timeout_secs: forkd_vmm::DEFAULT_CLOCK_SYNC_AGENT_TIMEOUT_SECS,
                 socket_wait_timeout_secs: forkd_vmm::DEFAULT_SOCKET_WAIT_SECS,
             },
             &work_dir,
@@ -4830,6 +4887,14 @@ mod tests {
             .unwrap();
     }
 
+    /// Pids the sweep tests park backups under, standing for bakes that have
+    /// exited. They must never name a live process, or the sweep leaves the
+    /// backup alone as a concurrent bake's: small made-up pids like 1000 are
+    /// often live on a CI runner. The kernel never hands out a pid above
+    /// `PID_MAX_LIMIT` (2^22 on 64-bit), so these cannot be.
+    const DEAD_PID_A: u32 = 4_194_305;
+    const DEAD_PID_B: u32 = 4_194_306;
+
     /// Review #295 approval follow-up (2026-09-02): a `kill -9` between
     /// the preserve-rename and the publish strands the backup under the
     /// dead run's pid, leaving the tag with no `rootfs.ext4`. The sweep
@@ -4839,8 +4904,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let snap_dir = tmp.path().join("tag");
         std::fs::create_dir_all(&snap_dir).unwrap();
-        let older = tmp.path().join("tag.rootfs.ext4.prev-1000");
-        let newer = tmp.path().join("tag.rootfs.ext4.prev-2000");
+        let older = tmp
+            .path()
+            .join(format!("tag.rootfs.ext4.prev-{DEAD_PID_A}"));
+        let newer = tmp
+            .path()
+            .join(format!("tag.rootfs.ext4.prev-{DEAD_PID_B}"));
         write_with_mtime(&older, b"OLD-ROOTFS", 1_700_000_000);
         // Ordering is by park time (ctime), so park the newer one later.
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4871,8 +4940,12 @@ mod tests {
         std::fs::create_dir_all(&snap_dir).unwrap();
         let live = snap_dir.join("rootfs.ext4");
         std::fs::write(&live, b"CURRENT-GOOD").unwrap();
-        let a = tmp.path().join("tag.rootfs.ext4.prev-1000");
-        let b = tmp.path().join("tag.rootfs.ext4.prev-2000");
+        let a = tmp
+            .path()
+            .join(format!("tag.rootfs.ext4.prev-{DEAD_PID_A}"));
+        let b = tmp
+            .path()
+            .join(format!("tag.rootfs.ext4.prev-{DEAD_PID_B}"));
         write_with_mtime(&a, b"STALE-A", 1_700_000_000);
         write_with_mtime(&b, b"STALE-B", 1_700_000_900);
         let now = std::time::SystemTime::now()
@@ -4905,7 +4978,9 @@ mod tests {
         let snap_dir = tmp.path().join("tag");
         std::fs::create_dir_all(&snap_dir).unwrap();
         write_with_mtime(&snap_dir.join("snapshot.json"), b"{}", 1_700_000_000);
-        let backup = tmp.path().join("tag.rootfs.ext4.prev-1000");
+        let backup = tmp
+            .path()
+            .join(format!("tag.rootfs.ext4.prev-{DEAD_PID_A}"));
         write_with_mtime(&backup, b"LAST-PUBLISHED", 1_700_000_000);
         std::fs::write(snap_dir.join("rootfs.ext4"), b"UNPUBLISHED-DIRTY-CLONE").unwrap();
 
@@ -4959,11 +5034,11 @@ mod tests {
         let held = tmp
             .path()
             .join("snapshots")
-            .join("tag.rootfs.ext4.prev-1000");
+            .join(format!("tag.rootfs.ext4.prev-{DEAD_PID_A}"));
         let other = tmp
             .path()
             .join("snapshots")
-            .join("other.rootfs.ext4.prev-1000");
+            .join(format!("other.rootfs.ext4.prev-{DEAD_PID_A}"));
         std::fs::write(&held, b"MINE").unwrap();
         std::fs::write(&other, b"OTHER-TAG").unwrap();
 

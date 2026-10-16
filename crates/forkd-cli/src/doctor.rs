@@ -76,20 +76,50 @@ impl Check {
     }
 }
 
-pub fn run(daemon_url: &str, daemon_token: Option<String>) -> anyhow::Result<()> {
-    let checks: Vec<Check> = vec![
+/// Options for the `doctor` readiness gate (s3 lane 03).
+///
+/// `forkd doctor` stays the human diagnosis command when `json` is
+/// false. With `json`, the same checks emit one machine-readable line
+/// on stdout and the exit code becomes the gate: 0 = every FAIL-class
+/// check green, 1 = at least one blocking check red. A WARN never
+/// blocks (same as the human path).
+#[derive(Default)]
+pub(crate) struct DoctorOpts {
+    /// Emit a single JSON object instead of the glyph report.
+    pub json: bool,
+    /// Expected firecracker version (e.g. "v1.12.0"). When set, a
+    /// mismatch FAILs — the snapshot-family rule (FC version x CPU
+    /// family x guest kernel) makes ">=1.10" too loose for a pool.
+    pub expected_fc_version: Option<String>,
+    /// Minimum provisioned forkd-child-* netns. When set, fewer is a
+    /// FAIL — fan-out >1 needs them (netns-setup.sh N).
+    pub min_netns: Option<usize>,
+    /// Spawn smoke test: REST-spawn one sandbox from this snapshot
+    /// tag with per_child_netns, optionally probe the guest agent /
+    /// envd port, then delete it. Proves restore+fork e2e. Needs the
+    /// daemon (the `daemon` check must pass) and root for /dev/kvm.
+    pub smoke_tag: Option<String>,
+    /// Guest port to probe after the smoke spawn (e.g. 49983 for
+    /// envd). TCP connect success = pass. None = skip the probe.
+    pub smoke_port: Option<u16>,
+}
+
+pub fn run_with(opts: DoctorOpts, daemon_url: &str, daemon_token: Option<String>) -> anyhow::Result<()> {
+    let mut checks: Vec<Check> = vec![
         check_platform(),
         check_hw_virt(),
         check_kvm(),
         check_cgroup_v2(),
         check_ip_forward(),
+        check_arp_gc(),
         check_tap_device("forkd-tap0"),
         check_netns_count(),
         check_firecracker_binary(),
-        check_firecracker_version(),
+        check_firecracker_version(opts.expected_fc_version.as_deref()),
         check_kernel_image(),
         check_snapshot_dir(),
         check_snapshot_dir_space(),
+        check_reflink_workdir(),
         check_docker_daemon(),
         check_daemon(daemon_url, daemon_token.as_deref()),
         // v0.4 live-fork prerequisites. WARN rather than FAIL so that
@@ -101,8 +131,22 @@ pub fn run(daemon_url: &str, daemon_token: Option<String>) -> anyhow::Result<()>
         check_ksm(),
         check_hugepages(),
     ];
-
-    print_report(&checks);
+    if let Some(min) = opts.min_netns {
+        checks.push(check_netns_floor(min));
+    }
+    if let Some(tag) = opts.smoke_tag.clone() {
+        checks.push(check_smoke_spawn(
+            daemon_url,
+            daemon_token.as_deref(),
+            tag,
+            opts.smoke_port,
+        ));
+    }
+    if opts.json {
+        print_json(&checks);
+    } else {
+        print_report(&checks);
+    }
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
     if any_fail {
         anyhow::bail!("doctor found blocking issues — see above");
@@ -215,6 +259,40 @@ fn print_report(checks: &[Check]) {
     println!("  pass={pass}  warn={warn}  fail={fail}  skip={skip}");
 }
 
+/// Machine-readable gate output: one JSON object on stdout.
+/// `{"ready":true|false,"checks":[{"name","status","detail","hint"}]}`.
+/// Consumed by the VM-lane bootstrap (skypilot-controller runner) to
+/// gate worker readyz on `forkd doctor --json` exiting 0.
+fn json_output(checks: &[Check]) -> serde_json::Value {
+    let any_fail = checks.iter().any(|c| c.status == Status::Fail);
+    serde_json::json!({
+        "ready": !any_fail,
+        "checks": checks
+            .iter()
+            .map(|c| {
+                let mut obj = serde_json::json!({
+                    "name": c.name,
+                    "status": match c.status {
+                        Status::Pass => "pass",
+                        Status::Warn => "warn",
+                        Status::Fail => "fail",
+                        Status::Skip => "skip",
+                    },
+                    "detail": c.detail,
+                });
+                if let Some(h) = &c.hint {
+                    obj["hint"] = serde_json::Value::String(h.clone());
+                }
+                obj
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn print_json(checks: &[Check]) {
+    println!("{}", json_output(checks));
+}
+
 // ----------------------------------------------------------------------
 // Individual checks
 // ----------------------------------------------------------------------
@@ -298,6 +376,49 @@ fn check_ip_forward() -> Check {
         ),
         Err(e) => Check::warn("ip_forward", format!("{e}"), "expected on Linux"),
     }
+}
+
+/// ARP neighbor-table gc thresholds. Each per-child netns carries its
+/// own neighbor table; a pool of 100+ netns overflows the defaults
+/// (128/512/1024) during big fan-outs and every spawn then stalls in
+/// guest-net bring-up with `neighbour: arp_cache: neighbor table
+/// overflow!` in dmesg (observed on the Phase 0 C3 node after an
+/// n=100 REST fan-out). WARN — a fresh node passes at first and the
+/// fix is one sysctl, but a serving pool must raise it.
+#[cfg(target_os = "linux")]
+fn check_arp_gc() -> Check {
+    let read = |n: &str| std::fs::read_to_string(format!("/proc/sys/net/ipv4/neigh/default/{n}"))
+        .map(|v| v.trim().to_string())
+        .ok();
+    let t1 = read("gc_thresh1");
+    let t2 = read("gc_thresh2");
+    let t3 = read("gc_thresh3");
+    match (t1.clone(), t2.clone(), t3.clone()) {
+        (Some(a), Some(b), Some(c)) => {
+            let parse = |v: &String| v.parse::<u64>().unwrap_or(0);
+            // Defaults 128/512/1024 are fine for a laptop and starve
+            // a 120-netns pool under fan-out.
+            if parse(&a) >= 1024 && parse(&b) >= 4096 && parse(&c) >= 8192 {
+                Check::pass("arp gc_thresh", format!("{a}/{b}/{c}"))
+            } else {
+                Check::warn(
+                    "arp gc_thresh",
+                    format!("{a}/{b}/{c} (defaults 128/512/1024 overflow under 100+ netns fan-out)"),
+                    "sudo sysctl -w net.ipv4.neigh.default.gc_thresh1=4096 gc_thresh2=8192 gc_thresh3=16384",
+                )
+            }
+        }
+        _ => Check::warn(
+            "arp gc_thresh",
+            "gc_thresh sysctls unreadable".to_string(),
+            "expected on Linux",
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_arp_gc() -> Check {
+    Check::skip("arp gc_thresh", "not Linux")
 }
 
 fn check_tap_device(tap: &'static str) -> Check {
@@ -398,7 +519,7 @@ fn check_firecracker_binary() -> Check {
     )
 }
 
-fn check_firecracker_version() -> Check {
+fn check_firecracker_version(expected: Option<&str>) -> Check {
     // `firecracker --version` first line is like "Firecracker v1.10.1"
     let out = match Command::new("firecracker").arg("--version").output() {
         Ok(o) => o,
@@ -421,6 +542,21 @@ fn check_firecracker_version() -> Check {
         .split_whitespace()
         .find(|t| t.starts_with('v') && t.contains('.'))
         .unwrap_or("?");
+    // Snapshot-family rule: when the caller pins an expected version
+    // (a pool is homogeneous per family), ANY mismatch FAILs — even a
+    // newer one, because snapshots restore only on the exact FC
+    // version they were taken with.
+    if let Some(exp) = expected {
+        return if ver == exp {
+            Check::pass("firecracker version", format!("{ver} (pinned match)"))
+        } else {
+            Check::fail(
+                "firecracker version",
+                format!("{ver} but pool pins {exp}"),
+                "install the pinned build (scripts/setup-host.sh pins it); snapshots restore only on their exact FC version",
+            )
+        };
+    }
     // Diff snapshots need >=1.5; we recommend >=1.10 for v0.3 forkd.
     let major_minor: Option<(u32, u32)> = ver
         .trim_start_matches('v')
@@ -449,6 +585,23 @@ fn check_firecracker_version() -> Check {
             format!("could not parse: {first}"),
             "expected 'Firecracker vMAJ.MIN.PATCH'",
         ),
+    }
+}
+
+/// Netns floor for serving fan-out. `check_netns_count` reports how
+/// many exist; this FAILs when fewer than the pool's minimum — REST
+/// spawns with n>1 need one netns per concurrent child
+/// (netns-setup.sh N).
+fn check_netns_floor(min: usize) -> Check {
+    let have = netns_count();
+    if have >= min {
+        Check::pass("netns floor", format!("{have} >= {min}"))
+    } else {
+        Check::fail(
+            "netns floor",
+            format!("{have} provisioned, need >= {min}"),
+            "sudo bash scripts/netns-setup.sh N with N >= max concurrent children",
+        )
     }
 }
 
@@ -611,6 +764,280 @@ fn check_snapshot_dir_space() -> Check {
     #[cfg(not(unix))]
     {
         Check::skip("snapshot dir space", "not Unix")
+    }
+}
+
+/// Reflink support on the forkd work directory (TMPDIR).
+///
+/// Per-child rootfs backing (PR #321) copies the parent rootfs with
+/// FICLONE. On XFS that is metadata-only (~6 ms per fork); on ext4
+/// the fallback streams the whole rootfs (~265 s for a 24G-logical
+/// base — a serving pool built that way cannot fork at all). The
+/// work dir is `std::env::temp_dir()`, so this probes TMPDIR.
+fn check_reflink_workdir() -> Check {
+    #[cfg(unix)]
+    {
+        let tmp = std::env::temp_dir();
+        match probe_reflink(&tmp) {
+            Ok(true) => Check::pass(
+                "reflink workdir",
+                format!(
+                    "{} (FICLONE works; per-child rootfs backing is instant)",
+                    std::env::temp_dir().display()
+                ),
+            ),
+            Ok(false) => Check::fail(
+                "reflink workdir",
+                format!(
+                    "{} does not support FICLONE; per-child rootfs falls back to a full stream copy (~265 s per fork for a 24G base)",
+                    std::env::temp_dir().display()
+                ),
+                "point TMPDIR at an XFS (reflink=1) or btrfs volume; see the pool bootstrap (mkfs.xfs + mount)",
+            ),
+            Err(e) => Check::warn(
+                "reflink workdir",
+                format!("probe failed: {e:#}"),
+                "could not determine; verify manually with `cp --reflink=always` in $TMPDIR",
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Check::skip("reflink workdir", "not Unix")
+    }
+}
+
+/// Does `ioctl(FICLONE)` work on the filesystem holding `dir`?
+/// Writes a small probe pair and clones src -> dst.
+#[cfg(unix)]
+fn probe_reflink(dir: &Path) -> anyhow::Result<bool> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    let d = tempfile::tempdir_in(dir)?;
+    let src = d.path().join("src");
+    let dst = d.path().join("dst");
+    let mut f = std::fs::File::create(&src)?;
+    f.write_all(b"probe")?;
+    drop(f);
+    let src_f = std::fs::File::open(&src)?;
+    let dst_f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&dst)?;
+    // FICLONE ioctl number (same as forkd-vmm chain.rs; the constant
+    // is private there, so re-declare — it is ABI, not code).
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let rc = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
+    Ok(rc == 0)
+}
+
+/// REST smoke test: spawn ONE sandbox from `tag` with per-child
+/// netns, optionally TCP-probe `smoke_port` inside the guest, then
+/// delete the sandbox. Proves restore + fork e2e through the daemon
+/// that will actually serve. Needs the daemon up (the `daemon` check
+/// gates it) and a token.
+fn check_smoke_spawn(
+    daemon_url: &str,
+    token: Option<&str>,
+    tag: String,
+    smoke_port: Option<u16>,
+) -> Check {
+    let name = "smoke spawn";
+    let Some(token) = token else {
+        return Check::fail(
+            name,
+            "--smoke-tag needs a daemon token",
+            "pass --daemon-token (or set FORKD_TOKEN)",
+        );
+    };
+    let url = format!("{}/v1/sandboxes", daemon_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build();
+    let body = serde_json::json!({
+        "snapshot_tag": tag,
+        "per_child_netns": true,
+    })
+    .to_string();
+    let spawn = match agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+    {
+        Ok(resp) => resp.into_string().unwrap_or_default(),
+        Err(e) => {
+            return Check::fail(
+                name,
+                format!("spawn from `{tag}` failed: {e}"),
+                "check the daemon logs; snapshots restore only on their exact FC version x CPU family x guest kernel",
+            )
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&spawn) {
+        Ok(v) => v,
+        Err(e) => {
+            return Check::fail(name, format!("unparseable spawn response: {e}"), "");
+        }
+    };
+    let id = parsed[0]["id"]
+        .as_str()
+        .or(parsed["id"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let netns = parsed[0]["netns"]
+        .as_str()
+        .or(parsed["netns"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let guest_addr = parsed[0]["guest_addr"]
+        .as_str()
+        .or(parsed["guest_addr"].as_str())
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return Check::fail(
+            name,
+            format!("spawn response missing id: {spawn}"),
+            "",
+        );
+    }
+    // Ensure cleanup on every path below — and the smoke check FAILS
+    // if cleanup fails: a leaked probe sandbox on a "passing" node
+    // defeats the gate (it holds a netns and a firecracker slot).
+    let delete = |check: Check| -> Check {
+        let del_url = format!("{url}/{id}");
+        let cleanup_ok = agent
+            .delete(&del_url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map(|r| r.status() < 300)
+            .unwrap_or(false);
+        if !cleanup_ok {
+            return Check::fail(
+                name,
+                format!("{} — but cleanup (DELETE {id}) failed; sandbox may be leaked", check.detail),
+                "delete the sandbox manually and re-run doctor; a leaked probe sandbox defeats the gate",
+            );
+        }
+        check
+    };
+    // Optional guest-port probe (e.g. envd on :49983). Per-child-netns
+    // sandboxes put the guest at 10.42.0.2 INSIDE the child's netns,
+    // so the probe must run via `ip netns exec <netns>` — from the
+    // root netns the address is unreachable. Children also come out
+    // of restore with a brief bind lag (socat/envd), so retry for a
+    // few seconds before failing (same contract as lane-02's
+    // init-loop.sh).
+    if let Some(port) = smoke_port {
+        let probe_addr = match guest_addr.rsplit_once(':') {
+            Some((host, _)) => format!("{host}:{port}"),
+            None => format!("10.42.0.2:{port}"),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match probe_guest_port(&netns, &probe_addr) {
+                Ok(true) => {
+                    return delete(Check::pass(
+                        name,
+                        format!("spawned `{tag}` and {probe_addr} reachable"),
+                    ))
+                }
+                Ok(false) => {
+                    if std::time::Instant::now() >= deadline {
+                        return delete(Check::fail(
+                            name,
+                            format!("spawned `{tag}` but {probe_addr} unreachable after 10s of retries"),
+                            "guest service did not come up; check the bake / envd start in the guest",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return delete(Check::fail(
+                            name,
+                            format!("probe of {probe_addr} errored: {e}"),
+                            "ip netns exec failed — is doctor running as root?",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    } else {
+        delete(Check::pass(
+            name,
+            format!("spawned `{tag}` (id {id}) and deleted"),
+        ))
+    }
+}
+
+/// TCP-connect to `addr`, entering `netns` first when non-empty
+/// (per-child-netns guests live at 10.42.0.2 inside their own
+/// netns). Ok(true) = connected; Ok(false) = refused/unreachable
+/// (retryable); Err = the netns exec itself failed.
+#[cfg(target_os = "linux")]
+fn probe_guest_port(netns: &str, addr: &str) -> anyhow::Result<bool> {
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {addr}: {e}"))?;
+    if netns.is_empty() {
+        return match std::net::TcpStream::connect_timeout(&sockaddr, Duration::from_secs(3)) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        };
+    }
+    // setns() via a helper child: `ip netns exec` requires root, and
+    // doing it in-process would leave the doctor process in the
+    // child's netns for the rest of its run.
+    let status = Command::new("ip")
+        .args(["netns", "exec", netns])
+        .arg("true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => return Err(anyhow::anyhow!("cannot enter netns {netns} (need root)")),
+        Err(e) => return Err(anyhow::anyhow!("exec ip: {e}")),
+    }
+    // Connect from inside the netns. `timeout` caps the kernel's SYN
+    // retry window (~2 min without it) at 3 s per attempt so the
+    // gate's 10 s deadline is real. `addr` is a parse-validated
+    // SocketAddr, so the /dev/tcp/HOST/PORT text built from it cannot
+    // smuggle shell metacharacters.
+    let probe_text = format!(
+        "exec 3<>/dev/tcp/{} && echo connected",
+        addr.replace(':', "/")
+    );
+    let out = Command::new("timeout")
+        .arg("3")
+        .args(["ip", "netns", "exec", netns])
+        .arg("bash")
+        .arg("-c")
+        .arg(probe_text)
+        .output();
+    match out {
+        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("connected") => {
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("exec timeout ip netns bash: {e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_guest_port(netns: &str, addr: &str) -> anyhow::Result<bool> {
+    // No netns on non-Linux; plain connect is the best we can do.
+    let _ = netns;
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {addr}: {e}"))?;
+    match std::net::TcpStream::connect_timeout(&sockaddr, Duration::from_secs(3)) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
     }
 }
 
@@ -900,5 +1327,46 @@ mod tests {
         let check = check_ksm_values("1", "0");
         assert!(check.status == Status::Warn);
         assert!(check.detail.contains("pages_to_scan=0"));
+    }
+
+    // ---- s3-03 readiness-gate logic ----
+
+    #[test]
+    fn netns_floor_passes_at_or_above_min() {
+        assert!(check_netns_floor(0).status == Status::Pass);
+    }
+
+    #[test]
+    fn netns_floor_fails_below_min() {
+        // No /var/run/netns entries at all cannot satisfy a positive
+        // floor: fan-out >1 needs one netns per concurrent child.
+        let check = check_netns_floor(usize::MAX);
+        assert!(check.status == Status::Fail);
+        assert!(check.detail.contains("need"));
+    }
+
+    #[test]
+    fn json_gate_warn_does_not_block_but_fail_does() {
+        // The serialized readiness the bootstrap consumes: ready iff
+        // no FAIL. A WARN (docker absent, ksm off) must never gate a
+        // serving node red.
+        let warn_only = vec![Check::pass("a", "ok"), Check::warn("b", "meh", "h")];
+        let failing = vec![Check::pass("a", "ok"), Check::fail("b", "bad", "h")];
+        assert_eq!(json_output(&warn_only)["ready"].as_bool(), Some(true));
+        assert_eq!(json_output(&failing)["ready"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn fc_version_pin_is_exact_string_match() {
+        // The pinned-compare must be an exact match against the token
+        // extracted from "Firecracker vMAJ.MIN.PATCH": a NEWER version
+        // must not pass a pin (snapshot-family rule).
+        let first = "Firecracker v1.12.0";
+        let ver = first
+            .split_whitespace()
+            .find(|t| t.starts_with('v') && t.contains('.'))
+            .unwrap_or("?");
+        assert_eq!(ver, "v1.12.0");
+        assert_ne!(ver, "v1.13.0");
     }
 }

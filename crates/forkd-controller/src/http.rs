@@ -482,11 +482,22 @@ async fn create_snapshot(
         // Volumes via daemon snapshot API will land in a follow-up commit;
         // for now snapshots created through the daemon are volume-less.
         // Use the CLI's `forkd snapshot --volume` for tag-shared caches.
-        let snap = vm.snapshot_to(
+        let mut snap = vm.snapshot_to(
             snap_dir_for_task.join("vmstate"),
             snap_dir_for_task.join("memory.bin"),
             Vec::new(),
         )?;
+        // Record the rootfs this parent booted from. Restore gives every child
+        // its own reflink backing cloned from this path, and with no path there
+        // is nothing to clone, so children fall back to sharing one file — the
+        // daemon's snapshots were the last ones doing that. Branches and
+        // workspace suspends record a clone of their own (see
+        // `Vm::detour_rootfs_into`).
+        snap.rootfs = Some(
+            cfg.rootfs
+                .canonicalize()
+                .unwrap_or_else(|_| cfg.rootfs.clone()),
+        );
         // Persist Snapshot metadata so subsequent forks read back the same
         // (possibly volume-bearing) snapshot description.
         let meta = serde_json::to_vec_pretty(&snap)?;
@@ -1202,8 +1213,20 @@ async fn create_sandbox(
         None
     };
     let spawn_n = req.n;
-    let spawn_per_child_netns = req.per_child_netns;
+    // S3-01 fan-out fix: an ABSENT `per_child_netns` defaults to true
+    // when n>1. A shared-tap batch (all children on one host tap fd)
+    // can neither restore concurrently nor address children
+    // individually, so the only working multi-child topology is
+    // per-child netns — make it the default instead of 503ing (s2-03
+    // receipt: "REST n>1 fails — shared tap busy"). An explicit
+    // `per_child_netns: false` with n>1 still hits the 503 below; n=1
+    // is unchanged (shared tap unless the caller opts into a netns).
+    let spawn_per_child_netns = req.per_child_netns.unwrap_or(req.n > 1);
     let spawn_mem_limit = req.memory_limit_mib;
+    let spawn_quota = forkd_vmm::cgroup::ChildQuota {
+        cpu_max: req.cpu_max.clone(),
+        pids_max: req.pids_max,
+    };
     let spawn_live_fork = req.live_fork;
     let spawn_hugepages = req.hugepages;
     let tag_for_work_dir = tag.clone();
@@ -1214,7 +1237,7 @@ async fn create_sandbox(
     // handler between restore success and registration does not wedge
     // the tap permanently. The token is the first child's sandbox id;
     // release_shared_tap_if_owner checks against it on teardown.
-    let use_shared_tap = !req.per_child_netns;
+    let use_shared_tap = !spawn_per_child_netns;
     let tap_owner_cell = s.shared_tap_owner.clone();
     let tap_token = if use_shared_tap {
         Some(new_sandbox_id())
@@ -1228,7 +1251,7 @@ async fn create_sandbox(
     // remain live on the same tap fd, causing EBUSY on the next
     // shared-tap spawn. The common case is n=1; n>1 shared-TAP spawns
     // are rejected with 503 until per-child tap ownership is modeled.
-    if use_shared_tap && req.n > 1 {
+    if use_shared_tap && spawn_n > 1 {
         return service_unavailable(
             "shared-TAP spawns with n>1 are not supported; use per_child_netns=true for multi-child spawns",
         );
@@ -1330,6 +1353,7 @@ async fn create_sandbox(
             n: spawn_n,
             per_child_netns: spawn_per_child_netns,
             memory_limit_mib: spawn_mem_limit,
+            quota: spawn_quota,
             netns_offset,
             prewarm_scratch_dir,
             // Phase 6 unstable: live_fork=true opts the sandbox into
@@ -1348,6 +1372,14 @@ async fn create_sandbox(
             // ~1 bit per page; negligible.
             enable_diff_snapshots: true,
             sync_guest_clocks: true,
+            // s3-01: bound the clock-sync agent poll. A restored
+            // forkd-agent answers in well under a second; an
+            // agent-less snapshot (E2B-shaped envd images) has NO
+            // listener on :8888 and would otherwise burn the full
+            // 10s budget per spawn (measured 10-13s per POST
+            // /v1/sandboxes on forkd-p0-1). 2s covers slow agent
+            // bring-up while capping the agent-less penalty.
+            clock_sync_timeout_secs: 2,
             // Under spawn bursts (warm-pool refill) the default 10s socket
             // wait can be too tight when prior-VM tap/netns teardown races
             // with new firecracker spawns. Give the daemon path a more
@@ -1359,7 +1391,10 @@ async fn create_sandbox(
         // ran concurrently (e.g. two branches of the same source). Mix the
         // netns offset in so concurrent batches get distinct work_dirs.
         let work_dir =
-            std::env::temp_dir().join(format!("forkd-daemon-{tag_for_work_dir}-o{netns_offset}"));
+            crate::state::work_dir_root().join(format!(
+                "{}{tag_for_work_dir}-o{netns_offset}",
+                crate::state::WORK_DIR_PREFIX
+            ));
         // v0.5 chain assembly. If `chain` is set, hash-verify each
         // parent against the recorded parent_content_hash (this is
         // the foot-gun guard committed to in the design doc), then
@@ -1975,7 +2010,7 @@ async fn branch_sandbox(
                 // our mmap.
                 #[cfg(target_os = "linux")]
                 if live_mode {
-                    let (live_pause_ms, worker) = run_live_branch_setup(
+                    let (live_pause_ms, worker, branch_rootfs) = run_live_branch_setup(
                         &vm,
                         &snap_dir_for_task,
                         &dst_mem,
@@ -2007,7 +2042,7 @@ async fn branch_sandbox(
                         volumes: source_volumes,
                         parent_tag: None,
                         parent_content_hash: None,
-                        rootfs: None,
+                        rootfs: branch_rootfs,
                     });
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -2037,6 +2072,15 @@ async fn branch_sandbox(
 
                 let pause_start = std::time::Instant::now();
                 vm.pause()?;
+
+                // A restored child's rootfs is its own backing, which dies
+                // with it. Point the drive at a copy this tag owns for the
+                // snapshot, so the vmstate records a durable path, and back
+                // before the source resumes (see `Vm::detour_rootfs_into`).
+                let rootfs_detour = vm
+                    .detour_rootfs_into(&snap_dir_for_task)
+                    .context("give the branch its own rootfs")?;
+                let branch_rootfs = rootfs_detour.as_ref().map(|d| d.path().to_path_buf());
 
                 // Phase 1a measurement hook: take a Diff snapshot first
                 // (captures pages dirtied since restore; clears the dirty
@@ -2093,6 +2137,9 @@ async fn branch_sandbox(
                         diff_snap.physical_size_bytes,
                         diff_snap.logical_size_bytes,
                     ));
+                    if let Some(detour) = rootfs_detour {
+                        detour.finish()?;
+                    }
                     let resume_result = vm.resume();
                     pause_ms = Some(pause_start.elapsed().as_millis() as u64);
 
@@ -2138,16 +2185,20 @@ async fn branch_sandbox(
                         volumes: diff_snap.volumes,
                         parent_tag: None,
                         parent_content_hash: None,
-                        rootfs: None,
+                        rootfs: branch_rootfs,
                     }
                 } else {
-                    let snap = vm.snapshot_to(
+                    let mut snap = vm.snapshot_to(
                         snap_dir_for_task.join("vmstate"),
                         snap_dir_for_task.join("memory.bin"),
                         // Inherit volumes from the source snapshot so grandchildren
                         // re-attach the same persistent disks the source had.
                         source_volumes,
                     )?;
+                    if let Some(detour) = rootfs_detour {
+                        detour.finish()?;
+                    }
+                    snap.rootfs = branch_rootfs;
                     // resume() may fail after a successful snapshot. The snapshot file
                     // is intact and usable; the source sandbox is in an unknown state
                     // (most likely still paused). We log and continue rather than
@@ -2607,7 +2658,7 @@ fn run_live_branch_setup(
     dst_mem: &std::path::Path,
     source_volumes: Vec<forkd_vmm::VolumeSpec>,
     id_for_log: &str,
-) -> anyhow::Result<(u64, LiveBranchWorker)> {
+) -> anyhow::Result<(u64, LiveBranchWorker, Option<std::path::PathBuf>)> {
     use std::os::fd::AsRawFd;
 
     let memfd = vm.memfd_handle().ok_or_else(|| {
@@ -2699,12 +2750,23 @@ fn run_live_branch_setup(
     // resume. PauseGuard's Drop resumes on early return.
     let pause_start = std::time::Instant::now();
     let pause_guard = vm.pause_guard()?;
+    // Declared after the pause guard so an early return drops it first: the
+    // drive goes home before the guard resumes the source. The clone runs
+    // inside the pause window — near-free with reflink, a full rootfs copy
+    // without it — because the copy has to match the vmstate's instant.
+    let rootfs_detour = vm
+        .detour_rootfs_into(snap_dir)
+        .context("give the branch its own rootfs")?;
+    let branch_rootfs = rootfs_detour.as_ref().map(|d| d.path().to_path_buf());
     vm.snapshot_vmstate_only(
         snap_dir.join("vmstate"),
         dst_mem.to_path_buf(),
         source_volumes,
     )
     .context("vmstate-only snapshot during live BRANCH")?;
+    if let Some(detour) = rootfs_detour {
+        detour.finish()?;
+    }
     pause_guard.resume().context("resume after vmstate dump")?;
     let pause_ms = pause_start.elapsed().as_millis() as u64;
 
@@ -2720,9 +2782,11 @@ fn run_live_branch_setup(
             mmap_guard,
             wp_branch,
         },
+        branch_rootfs,
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn preallocate_memory_file(path: &std::path::Path, size: u64) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
@@ -2743,6 +2807,21 @@ fn preallocate_memory_file(path: &std::path::Path, size: u64) -> anyhow::Result<
         let err = std::io::Error::from_raw_os_error(rc);
         anyhow::bail!("posix_fallocate({size}): {err}");
     }
+    Ok(())
+}
+
+/// Non-Linux: no posix_fallocate; a plain truncate is the closest
+/// portable equivalent (still sparse, but reserves the length).
+#[cfg(not(target_os = "linux"))]
+fn preallocate_memory_file(path: &std::path::Path, size: u64) -> anyhow::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open for preallocate: {}", path.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("set_len({size}) on {}", path.display()))?;
     Ok(())
 }
 
@@ -2910,6 +2989,7 @@ fn spawn_one_for_workspace(
     snapshot_tag: &str,
     per_child_netns: bool,
     memory_limit_mib: Option<u64>,
+    quota: forkd_vmm::cgroup::ChildQuota,
 ) -> anyhow::Result<(
     forkd_vmm::Vm,
     SandboxInfo,
@@ -2972,11 +3052,13 @@ fn spawn_one_for_workspace(
         n: 1,
         per_child_netns,
         memory_limit_mib,
+        quota,
         netns_offset,
         prewarm_scratch_dir: None,
         memory_backend: forkd_vmm::MemoryBackend::File,
         enable_diff_snapshots: true,
         sync_guest_clocks: true,
+        clock_sync_timeout_secs: 2,
         socket_wait_timeout_secs: daemon_socket_wait_timeout_secs(),
     };
     let work_dir =
@@ -3045,9 +3127,19 @@ async fn create_workspace(
     let snapshot_tag = req.snapshot_tag.clone();
     let per_child_netns = req.per_child_netns;
     let memory_limit_mib = req.memory_limit_mib;
+    let quota = forkd_vmm::cgroup::ChildQuota {
+        cpu_max: req.cpu_max.clone(),
+        pids_max: req.pids_max,
+    };
     let s_clone = s.clone();
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &snapshot_tag, per_child_netns, memory_limit_mib)
+        spawn_one_for_workspace(
+            &s_clone,
+            &snapshot_tag,
+            per_child_netns,
+            memory_limit_mib,
+            quota,
+        )
     })
     .await;
 
@@ -3216,6 +3308,12 @@ async fn suspend_workspace(
                 None
             };
             vm.pause()?;
+            // As in `branch_sandbox`: the state snapshot must own its rootfs,
+            // not record the live child's backing, which dies with the child.
+            let rootfs_detour = vm
+                .detour_rootfs_into(&snap_dir_for_task)
+                .context("give the workspace state its own rootfs")?;
+            let state_rootfs = rootfs_detour.as_ref().map(|d| d.path().to_path_buf());
             let snap = if diff_mode {
                 let diff_path = std::env::temp_dir().join(format!(
                     "forkd-ws-diff-{}-{}.bin",
@@ -3227,6 +3325,9 @@ async fn suspend_workspace(
                     diff_path.clone(),
                     Vec::new(),
                 )?;
+                if let Some(detour) = rootfs_detour {
+                    detour.finish()?;
+                }
                 vm.resume()?;
                 pause_ms = Some(pause_start.elapsed().as_millis() as u64);
                 if let Some(h) = cp_handle {
@@ -3241,14 +3342,18 @@ async fn suspend_workspace(
                     volumes: diff_snap.volumes,
                     parent_tag: None,
                     parent_content_hash: None,
-                    rootfs: None,
+                    rootfs: state_rootfs,
                 }
             } else {
-                let snap = vm.snapshot_to(
+                let mut snap = vm.snapshot_to(
                     snap_dir_for_task.join("vmstate"),
                     snap_dir_for_task.join("memory.bin"),
                     Vec::new(),
                 )?;
+                if let Some(detour) = rootfs_detour {
+                    detour.finish()?;
+                }
+                snap.rootfs = state_rootfs;
                 vm.resume()?;
                 pause_ms = Some(pause_start.elapsed().as_millis() as u64);
                 snap
@@ -3360,7 +3465,13 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
     // which collides when several workspaces are active.
     let per_child_netns = ws.per_child_netns;
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None)
+        spawn_one_for_workspace(
+            &s_clone,
+            &spawn_tag,
+            per_child_netns,
+            None,
+            Default::default(),
+        )
     })
     .await;
     let (vm, sb_info, mut netns_reservation, mut tap_claim) = match spawn_result {
@@ -4453,6 +4564,78 @@ mod tests {
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "per-netns spawn must not hit the shared-tap 503 path"
+        );
+    }
+
+    /// S3-01 fan-out: `POST /v1/sandboxes` with `n>1` and no explicit
+    /// `per_child_netns` must fan out over per-child netns instead of
+    /// being rejected by the shared-tap n>1 guard. The request below
+    /// pins the default: it must NOT take the shared-tap path (which
+    /// 503s) — it must reserve per-child netns (0-pool here => the
+    /// documented NetnsExhausted 503, which is distinguishable from
+    /// the shared-tap 503 by its message) or, with a pool available,
+    /// proceed into the restore. We assert the error body names the
+    /// netns pool, NOT forkd-tap0.
+    #[tokio::test]
+    async fn create_sandbox_n_gt_1_defaults_to_per_child_netns() {
+        let state = test_state_with_netns(0);
+        write_base_snapshot(&state, "base");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"snapshot_tag":"base","n":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(
+            err["error"].to_string().to_ascii_lowercase(),
+            std::string::String::new(),
+            "n>1 without per_child_netns must not hit the shared-tap guard; got: {}",
+            err["error"]
+        );
+        assert!(
+            !err["error"].to_string().contains("shared-TAP"),
+            "n=2 default must route to per-child netns, not the shared-tap n>1 rejection: {}",
+            err["error"]
+        );
+    }
+
+    /// S3-01 fan-out: an EXPLICIT `per_child_netns: false` with n>1
+    /// keeps the old 503 (the operator asked for the broken topology).
+    #[tokio::test]
+    async fn create_sandbox_explicit_shared_tap_n_gt_1_still_503() {
+        let state = test_state();
+        write_base_snapshot(&state, "base");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"snapshot_tag":"base","n":2,"per_child_netns":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            err["error"].to_string().contains("shared-TAP"),
+            "explicit per_child_netns=false with n>1 must stay 503 shared-TAP, got: {}",
+            err["error"]
         );
     }
 

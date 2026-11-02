@@ -2468,12 +2468,12 @@ mod adopt_tests {
     #[cfg(target_os = "linux")]
     fn child_sock_from_cmdline_parses_api_sock_arg() {
         use std::process::{Command, Stdio};
-        // A process with "--api-sock <path>" in argv. Use `sleep` with a
-        // fake arg: cmdline reading doesn't care about the binary.
-        let mut child = Command::new("sleep")
-            .arg("--api-sock")
+        // A process with "--api-sock <path>" in argv. `sh -c` takes them as
+        // positional args and stays alive (`; :` stops it exec'ing sleep);
+        // `sleep --api-sock` exits at once on coreutils that reject it.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30; :", "sh", "--api-sock"])
             .arg("/tmp/fake-forkd/child-1.sock")
-            .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

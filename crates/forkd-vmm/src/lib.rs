@@ -17,8 +17,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1564,14 +1562,17 @@ fn repoint_rootfs(sock: &Path, path: &Path) -> Result<()> {
 fn load_paused_rebind_rootfs_and_resume(
     sock: &Path,
     load_body: &str,
-    tag_rootfs: &Path,
+    tag_rootfs: Option<&Path>,
     backing: &Path,
 ) -> Result<bool> {
     api_call(sock, "PUT", "/snapshot/load", load_body)
         .context("load child paused (resume_vm=false)")?;
-    let (_, read_only) = rootfs_drive(sock).context("read the restored child's rootfs drive")?;
-    if !read_only {
-        crate::chain::reflink_copy(tag_rootfs, backing)
+    let (restored, read_only) =
+        rootfs_drive(sock).context("read the restored child's rootfs drive")?;
+    if !read_only && tag_rootfs.is_some() {
+        let _ = &restored;
+        let src = tag_rootfs.unwrap_or(&restored);
+        crate::chain::reflink_copy(src, backing)
             .with_context(|| format!("child rootfs backing {}", backing.display()))?;
         repoint_rootfs(sock, backing).with_context(|| {
             format!(
@@ -2704,22 +2705,22 @@ impl Snapshot {
             }
         }
 
-        // Every child of a tag that recorded a rootfs is assigned its own
-        // backing path up front, and owns it from here: Drop removes it, so a
-        // failed or killed child reclaims the copy instead of leaving a full
-        // rootfs in a work dir nothing sweeps. The copy itself is made in the
-        // child's restore thread below, once the loaded vmstate has said
-        // whether the drive is writable at all. Snapshots with no recorded
-        // rootfs keep the previous behaviour.
+        // Every child is assigned its own backing path up front, and owns it
+        // from here: Drop removes it, so a failed or killed child reclaims the
+        // copy instead of leaving a full rootfs in a work dir nothing sweeps.
+        // The copy itself is made in the child's restore thread below, once
+        // the loaded vmstate has said whether the drive is writable and which
+        // file it reopened. A tag with no recorded rootfs clones that file.
         let tag_rootfs = self.rootfs.clone();
+        let backing_stem = tag_rootfs
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("rootfs.ext4"));
         let mut backings: Vec<Option<PathBuf>> = vec![None; children.len()];
-        if let Some(tag_rootfs) = &tag_rootfs {
-            for (i, slot) in children.iter_mut().enumerate() {
-                let Some(c) = slot else { continue };
-                let backing = child_rootfs_backing(work_dir, i + 1, tag_rootfs);
-                c.backing = Some(backing.clone());
-                backings[i] = Some(backing);
-            }
+        for (i, slot) in children.iter_mut().enumerate() {
+            let Some(c) = slot else { continue };
+            let backing = child_rootfs_backing(work_dir, i + 1, &backing_stem);
+            c.backing = Some(backing.clone());
+            backings[i] = Some(backing);
         }
 
         // Phase 2: parallel restore via threads. Each thread issues one
@@ -2770,14 +2771,14 @@ impl Snapshot {
                 i,
                 pid,
                 thread::spawn(move || -> Result<bool> {
-                    match (backing, tag_rootfs) {
-                        (Some(backing), Some(tag_rootfs)) => load_paused_rebind_rootfs_and_resume(
+                    match backing {
+                        Some(backing) => load_paused_rebind_rootfs_and_resume(
                             &sock,
                             &body,
-                            &tag_rootfs,
+                            tag_rootfs.as_deref(),
                             &backing,
                         ),
-                        _ => api_call(&sock, "PUT", "/snapshot/load", &body).map(|()| false),
+                        None => api_call(&sock, "PUT", "/snapshot/load", &body).map(|()| false),
                     }
                 }),
             ));
@@ -3298,7 +3299,7 @@ mod tests {
         std::fs::write(&base, b"base").unwrap();
         let backing = dir.join("child-1.rootfs.ext4");
         let fc = FakeFirecracker::start("noresume", base.to_str().unwrap(), false, false);
-        let r = load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", &base, &backing);
+        let r = load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", Some(&base), &backing);
         assert!(r.is_err(), "a child left on the shared base must fail");
         let requests = fc.requests();
         assert!(
@@ -3318,7 +3319,8 @@ mod tests {
         std::fs::write(&base, b"base").unwrap();
         let backing = dir.join("child-1.rootfs.ext4");
         let fc = FakeFirecracker::start("writable", base.to_str().unwrap(), false, true);
-        let used = load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", &base, &backing).unwrap();
+        let used =
+            load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", Some(&base), &backing).unwrap();
         assert!(used);
         assert_eq!(std::fs::read(&backing).unwrap(), b"base");
         assert_eq!(
@@ -3344,12 +3346,58 @@ mod tests {
         std::fs::write(&base, b"base").unwrap();
         let backing = dir.join("child-1.rootfs.squashfs");
         let fc = FakeFirecracker::start("readonly", base.to_str().unwrap(), true, true);
-        let used = load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", &base, &backing).unwrap();
+        let used =
+            load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", Some(&base), &backing).unwrap();
         assert!(!used);
         assert!(!backing.exists(), "a read-only rootfs must not be copied");
         assert_eq!(
             fc.requests(),
             ["PUT /snapshot/load", "GET /vm/config", "PATCH /vm"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// c-69 class: a tag whose snapshot.json records no rootfs (pre-#321
+    /// bakes, unpacked packs) used to hand every child the vmstate's shared
+    /// writable file. Two concurrent children must each get a private clone
+    /// of the file the vmstate reopened, and the base must stay pristine.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn concurrent_children_of_an_unrecorded_rootfs_get_private_backings() {
+        let dir =
+            std::env::temp_dir().join(format!("forkd-rebind-unrecorded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("rootfs.ext4");
+        std::fs::write(&base, b"base").unwrap();
+        let handles: Vec<_> = (1..=2)
+            .map(|i| {
+                let fc = FakeFirecracker::start(
+                    &format!("unrecorded{i}"),
+                    base.to_str().unwrap(),
+                    false,
+                    true,
+                );
+                let backing = dir.join(format!("child-{i}.rootfs.ext4"));
+                thread::spawn(move || {
+                    let used = load_paused_rebind_rootfs_and_resume(&fc.sock, "{}", None, &backing)
+                        .unwrap();
+                    assert!(used, "a writable unrecorded rootfs must get a backing");
+                    let (now, _) = rootfs_drive(&fc.sock).unwrap();
+                    assert_eq!(now, backing, "child must run on its own backing");
+                    // The guest's writes land in its backing only.
+                    std::fs::write(&backing, format!("child-{i}")).unwrap();
+                    backing
+                })
+            })
+            .collect();
+        let backings: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_ne!(backings[0], backings[1]);
+        assert_eq!(std::fs::read(&backings[0]).unwrap(), b"child-1");
+        assert_eq!(std::fs::read(&backings[1]).unwrap(), b"child-2");
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            b"base",
+            "base must stay pristine"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

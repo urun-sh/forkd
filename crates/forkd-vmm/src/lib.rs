@@ -1569,8 +1569,10 @@ fn load_paused_rebind_rootfs_and_resume(
         .context("load child paused (resume_vm=false)")?;
     let (restored, read_only) =
         rootfs_drive(sock).context("read the restored child's rootfs drive")?;
-    if !read_only && tag_rootfs.is_some() {
-        let _ = &restored;
+    if !read_only {
+        // A snapshot.json with no recorded rootfs (older bakes, unpacked
+        // packs) still restores a writable drive: clone the path the vmstate
+        // reopened rather than let every child share it.
         let src = tag_rootfs.unwrap_or(&restored);
         crate::chain::reflink_copy(src, backing)
             .with_context(|| format!("child rootfs backing {}", backing.display()))?;

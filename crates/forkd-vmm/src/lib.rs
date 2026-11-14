@@ -2197,7 +2197,7 @@ impl Snapshot {
                 per_child_netns: false,
                 memory_limit_mib: None,
                 netns_indices: Vec::new(),
-            netns_offset: 0,
+                netns_offset: 0,
                 prewarm_scratch_dir: None,
                 memory_backend: MemoryBackend::File,
                 enable_diff_snapshots: false,

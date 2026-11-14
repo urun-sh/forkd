@@ -2531,7 +2531,7 @@ mod adopt_tests {
         for _ in 0..8 {
             let r = alloc.reserve(1).expect("reserve must succeed");
             assert_ne!(
-                r.offset() + 1,
+                r.indices()[0],
                 3,
                 "adopted index 3 must not be handed to a new spawn"
             );

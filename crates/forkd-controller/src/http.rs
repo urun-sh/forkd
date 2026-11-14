@@ -4949,14 +4949,18 @@ mod tests {
         let a = crate::netns::NetnsAllocator::new(4, Box::new(crate::netns::RangeProbe { max: 4 }));
         // Simulate create_sandbox: reserve → commit (VM in live_vms)
         let mut r1 = a.reserve(1).expect("reserve");
-        let idx = r1.offset();
+        let idx = r1.indices()[0]; // the VM's netns index (forkd-child-N)
         r1.commit();
         // Simulate VmNetnsGuard::drop (cancellation or DELETE during BRANCH):
         // release_index makes the index available again.
-        a.release_index(idx + 1); // reserve(1) covers index offset+1
-                                  // The released index must be reusable.
+        a.release_index(idx);
+        // The released index must be reusable.
         let r2 = a.reserve(1).expect("released index should be reusable");
-        assert_eq!(r2.offset(), idx, "released index should be picked first");
+        assert_eq!(
+            r2.indices()[0],
+            idx,
+            "released index should be picked first"
+        );
     }
 
     /// Verify that an uncommitted reservation held inside a blocking

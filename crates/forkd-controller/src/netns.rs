@@ -270,8 +270,8 @@ mod tests {
         assert_eq!(r1.indices(), &[1, 2]);
         let r2 = a.reserve(1).expect("r2");
         assert_eq!(r2.indices(), &[3]);
-                                    // commit r1 — indices 1,2 become ACTIVE (owned by live VMs), not
-                                    // free: a committed range must not be reused while its VMs live.
+        // commit r1 — indices 1,2 become ACTIVE (owned by live VMs), not
+        // free: a committed range must not be reused while its VMs live.
         r1.commit();
         let r3 = a.reserve(1).expect("r3");
         assert_eq!(r3.indices(), &[4]); // 1,2 active; 3 reserved
@@ -287,11 +287,11 @@ mod tests {
         // While active, the range is NOT reusable.
         assert!(a.reserve(1).is_some()); // takes the lowest free index
         assert_eq!(a.reserve(2).expect("r2").indices(), &[4, 5]);
-                                                           // Release index 1 only (VM 1 deleted, VM 2 still live).
+        // Release index 1 only (VM 1 deleted, VM 2 still live).
         a.release_index(1);
         let r = a.reserve(1).expect("r3");
         assert_eq!(r.indices(), &[1]); // index 1 free, index 2 active
-                                   // Releasing an already-free index is a no-op.
+                                       // Releasing an already-free index is a no-op.
         a.release_index(1);
         a.release_index(99);
     }
@@ -330,8 +330,10 @@ mod tests {
             })
             .collect();
         barrier.wait(); // main joins the reservation window
-        let mut all_indices: Vec<usize> =
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut all_indices: Vec<usize> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         all_indices.sort();
         all_indices.dedup();
         assert_eq!(all_indices.len(), 32, "index sets overlap: {all_indices:?}");
@@ -439,7 +441,9 @@ mod tests {
         a.release_index(6);
         // n=3 with 4 free: the old contiguous-only scan has no run of 3
         // and returned None — the new lowest-first fill takes 1,2,4.
-        let mut r = a.reserve(3).expect("fragmentation must not fail a satisfiable request");
+        let mut r = a
+            .reserve(3)
+            .expect("fragmentation must not fail a satisfiable request");
         assert_eq!(r.indices(), &[1, 2, 4]);
         r.commit();
         // Committed indices are ACTIVE (live VMs): only 5,6 remain free,

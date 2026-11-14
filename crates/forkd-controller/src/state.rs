@@ -2480,8 +2480,21 @@ mod adopt_tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        let sock =
-            Registry::child_sock_from_cmdline(pid).expect("parse --api-sock from live cmdline");
+        // spawn() returns once the vfork'd child's exec swaps mm, but the
+        // kernel publishes the new argv (mm->arg_start/arg_end) a moment
+        // later — an immediate /proc/<pid>/cmdline read can see it empty
+        // under CI load. Poll briefly (bounded) for the argv to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let sock = loop {
+            if let Some(s) = Registry::child_sock_from_cmdline(pid) {
+                break s;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parse --api-sock from live cmdline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert_eq!(
             sock,
             std::path::PathBuf::from("/tmp/fake-forkd/child-1.sock")

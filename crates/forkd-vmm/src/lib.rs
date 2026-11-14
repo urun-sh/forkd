@@ -702,6 +702,14 @@ pub struct ForkOpts {
     /// source sandbox holds `forkd-child-1`, grandchildren start higher).
     /// Index zero is never assigned — the first index is always
     /// `netns_offset + 1`.
+    ///
+    /// Daemon-path spawns instead carry the EXACT reserved indices in
+    /// `netns_indices` (one per child, 1-based on the wire): the allocator
+    /// hands out any free indices, not a contiguous range (prod lax
+    /// 2026-11-14: a contiguous-range scan 503'd n=100 with 89 indices
+    /// free once live children fragmented the pool). Empty falls back to
+    /// the legacy `netns_offset + child_index` naming (CLI cold-boot path).
+    pub netns_indices: Vec<usize>,
     pub netns_offset: usize,
     /// If Some, immediately after restore each child is pre-warmed by
     /// taking a throwaway snapshot into this scratch directory. This
@@ -771,6 +779,7 @@ impl Default for ForkOpts {
             n: 1,
             per_child_netns: false,
             memory_limit_mib: None,
+            netns_indices: Vec::new(),
             netns_offset: 0,
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
@@ -2187,7 +2196,8 @@ impl Snapshot {
                 n,
                 per_child_netns: false,
                 memory_limit_mib: None,
-                netns_offset: 0,
+                netns_indices: Vec::new(),
+            netns_offset: 0,
                 prewarm_scratch_dir: None,
                 memory_backend: MemoryBackend::File,
                 enable_diff_snapshots: false,
@@ -2244,7 +2254,11 @@ impl Snapshot {
             // Per-child files use the within-batch index (1..=n) so work_dir
             // layout is predictable. Netns / cgroup index applies the offset
             // so multiple batches can coexist on one host (branching case).
-            let global_idx = opts.netns_offset + i;
+            let global_idx = opts
+                .netns_indices
+                .get(i - 1)
+                .copied()
+                .unwrap_or(opts.netns_offset + i);
             let sock = work_dir.join(format!("child-{i}.sock"));
             let console = work_dir.join(format!("child-{i}.console"));
             // If per-child netns mode, look for forkd-child-<global_idx>
@@ -2361,7 +2375,10 @@ impl Snapshot {
                 // Cgroup leaf name tracks the global netns index so per-child
                 // resource limits don't collide with siblings created by other
                 // batches on the same host.
-                let name = format!("child-{}", opts.netns_offset + i + 1);
+                let name = match opts.netns_indices.get(i - 1) {
+                    Some(&idx) => format!("child-{idx}"),
+                    None => format!("child-{}", opts.netns_offset + i + 1),
+                };
                 match cgroup::place_child(&name, child.pid, bytes) {
                     Ok(path) => {
                         tracing::debug!(name=%name, pid=child.pid, mib, "cgroup placed");
@@ -3681,6 +3698,7 @@ mod tests {
             n: 1,
             per_child_netns: false,
             memory_limit_mib: None,
+            netns_indices: Vec::new(),
             netns_offset: 0,
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,

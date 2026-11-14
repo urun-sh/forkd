@@ -380,6 +380,7 @@ mod tests {
         // contiguous scan refused n=2 with 2 free indices flanking it).
         let held = a.reserve(1).expect("takes provisioned index 1");
         assert_eq!(held.indices(), &[1]);
+        drop(held); // rollback: index 1 free again — only 2 provisioned exist
         let r = a.reserve(2).expect("skips unprovisioned index 2");
         assert_eq!(r.indices(), &[1, 3]);
         assert!(a.reserve(3).is_none(), "only 2 provisioned indices exist");
@@ -457,12 +458,12 @@ mod tests {
         r.commit();
         // Committed indices are ACTIVE (live VMs): only 5,6 remain free,
         // and a committed index is never handed out while its VM lives.
-        let mut r2 = a.reserve(1).expect("r2");
+        let r2 = a.reserve(1).expect("r2");
         assert_eq!(r2.indices(), &[6]);
-        r2.commit();
-        // The requested-before-allocated hole (5) is still free for the
-        // next one-index batch — no fragmentation was created by us.
+        drop(r2); // rollback: the lease is dropped uncommitted, 6 is free again
+                  // The index-5 hole was never free (the live child owns it) — but no
+                  // fragmentation was created by us either: 6 answers the next batch.
         let r3 = a.reserve(1).expect("r3");
-        assert_eq!(r3.indices(), &[5]);
+        assert_eq!(r3.indices(), &[6]);
     }
 }

@@ -446,7 +446,7 @@ mod tests {
         r2.commit();
         // The requested-before-allocated hole (5) is still free for the
         // next one-index batch — no fragmentation was created by us.
-        let mut r3 = a.reserve(1).expect("r3");
+        let r3 = a.reserve(1).expect("r3");
         assert_eq!(r3.indices(), &[5]);
     }
 }

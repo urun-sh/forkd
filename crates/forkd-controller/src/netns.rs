@@ -329,7 +329,11 @@ mod tests {
             .flat_map(|h| h.join().unwrap())
             .collect();
         all_indices.sort();
-        assert_eq!(all_indices.len(), 128, "index sets overlap: {all_indices:?}");
+        assert_eq!(
+            all_indices.len(),
+            128,
+            "index sets overlap: {all_indices:?}"
+        );
         let unique: std::collections::HashSet<usize> = all_indices.iter().copied().collect();
         assert_eq!(unique.len(), 128);
     }

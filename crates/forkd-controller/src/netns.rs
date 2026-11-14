@@ -285,7 +285,8 @@ mod tests {
         let mut r1 = a.reserve(2).expect("r1"); // covers 1,2
         r1.commit();
         // While active, the range is NOT reusable.
-        assert!(a.reserve(1).is_some()); // takes the lowest free index
+        let held = a.reserve(1).expect("takes the lowest free index");
+        assert_eq!(held.indices(), &[3]);
         assert_eq!(a.reserve(2).expect("r2").indices(), &[4, 5]);
         // Release index 1 only (VM 1 deleted, VM 2 still live).
         a.release_index(1);
@@ -335,8 +336,9 @@ mod tests {
             .flat_map(|h| h.join().unwrap())
             .collect();
         all_indices.sort();
-        all_indices.dedup();
-        assert_eq!(all_indices.len(), 32, "index sets overlap: {all_indices:?}");
+        assert_eq!(all_indices.len(), 128, "index sets overlap: {all_indices:?}");
+        let unique: std::collections::HashSet<usize> = all_indices.iter().copied().collect();
+        assert_eq!(unique.len(), 128);
     }
 
     #[test]
@@ -369,11 +371,14 @@ mod tests {
         std::fs::write(dir.path().join("forkd-child-3"), b"").unwrap();
         let a = NetnsAllocator::discover(dir.path());
         assert_eq!(a.provisioned(), 3);
-        // Only provisioned indices are usable: offset 0 (covers 1) works,
-        // offset 1 (covers 2, which is not provisioned) does not.
-        assert!(a.reserve(1).is_some());
-        drop(a.reserve(1));
-        assert!(a.reserve(2).is_none(), "index 2 is not provisioned");
+        // Only provisioned indices are usable: any-free allocation skips
+        // the unprovisioned index 2 instead of failing the batch (the old
+        // contiguous scan refused n=2 with 2 free indices flanking it).
+        let held = a.reserve(1).expect("takes provisioned index 1");
+        assert_eq!(held.indices(), &[1]);
+        let r = a.reserve(2).expect("skips unprovisioned index 2");
+        assert_eq!(r.indices(), &[1, 3]);
+        assert!(a.reserve(3).is_none(), "only 2 provisioned indices exist");
     }
 
     #[test]

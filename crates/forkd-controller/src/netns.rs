@@ -415,4 +415,41 @@ mod tests {
         }
         assert_eq!(a.reserve(1).unwrap().offset(), 0);
     }
+
+    /// Prod lax 2026-11-14 receipt: with 100 netns provisioned and live
+    /// children at forkd-child-1..11, `POST /v1/sandboxes n=100` answered
+    /// an instant 503 "netns pool exhausted" while `n=87` returned 201 —
+    /// free >= n but no single contiguous free run of n. `reserve` MUST
+    /// allocate any free indices (lowest first) so mid-pool fragmentation
+    /// never fails a satisfiable request.
+    #[test]
+    fn reserve_fills_around_active_fragmentation() {
+        let a = alloc(10);
+        let mut c1 = a.reserve(3).expect("c1"); // 1,2,3
+        c1.commit();
+        let mut c2 = a.reserve(3).expect("c2"); // 4,5,6
+        c2.commit();
+        let mut c3 = a.reserve(4).expect("c3"); // 7..10
+        c3.commit();
+        // Pool fully committed. Live children then deleted: 1,2 and 4,6
+        // free again — free = {1,2,4,6}, largest contiguous run 2.
+        a.release_index(1);
+        a.release_index(2);
+        a.release_index(4);
+        a.release_index(6);
+        // n=3 with 4 free: the old contiguous-only scan has no run of 3
+        // and returned None — the new lowest-first fill takes 1,2,4.
+        let mut r = a.reserve(3).expect("fragmentation must not fail a satisfiable request");
+        assert_eq!(r.indices(), &[1, 2, 4]);
+        r.commit();
+        // Committed indices are ACTIVE (live VMs): only 5,6 remain free,
+        // and a committed index is never handed out while its VM lives.
+        let mut r2 = a.reserve(1).expect("r2");
+        assert_eq!(r2.indices(), &[6]);
+        r2.commit();
+        // The requested-before-allocated hole (5) is still free for the
+        // next one-index batch — no fragmentation was created by us.
+        let mut r3 = a.reserve(1).expect("r3");
+        assert_eq!(r3.indices(), &[5]);
+    }
 }

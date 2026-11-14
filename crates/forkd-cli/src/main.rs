@@ -2602,6 +2602,7 @@ fn run_cmd(
                 per_child_netns: false,
                 memory_limit_mib: None,
                 quota: forkd_vmm::cgroup::ChildQuota::default(),
+                netns_indices: Vec::new(),
                 netns_offset: 0,
                 prewarm_scratch_dir: None,
                 memory_backend: forkd_vmm::MemoryBackend::File,
@@ -4025,6 +4026,7 @@ fn fork_cmd(
                 // CLI `forkd fork` is one-shot: it always allocates starting
                 // from forkd-child-1. The daemon path picks a non-colliding
                 // offset based on live state; the CLI doesn't have that view.
+                netns_indices: Vec::new(),
                 netns_offset: 0,
                 // CLI fork is one-shot — caller can re-run if cold matters.
                 // The daemon's create_sandbox path is where prewarm pays off.

@@ -32,6 +32,13 @@
 set -euo pipefail
 
 N="${1:-10}"
+# Parallel provisioning pool: each child is fully self-contained (its own
+# netns/tap/veth/route/SNAT — the only shared object, the host bridge, is
+# created before the pool starts). Prod lax 2026-11-14 receipt: sequential
+# provisioning ran ~230 ms per child, so the forkd-netns bootstrap stage
+# blew its budget at minNetns=1200 (~4.6 min of serial `ip netns add`) and
+# the VM died pre-readiness; the stage could never reach R300/R1000.
+NETNS_SETUP_PARALLELISM="${NETNS_SETUP_PARALLELISM:-16}"
 # $USER is unset in non-login shells (docker exec, some CI) and this
 # script runs under `set -u` — fall back through id(1).
 USER_OWNS="${2:-${SUDO_USER:-${USER:-$(id -un)}}}"
@@ -74,8 +81,11 @@ if [ -n "$UPLINK" ]; then
     fi
 fi
 
-# ----- per-child setup ---------------------------------------------------
-for i in $(seq 1 "$N"); do
+# ----- per-child setup (parallel pool) ------------------------------------
+# Every statement below is per-child state (netns-local tap/route/SNAT,
+# uniquely-named veth); nothing touches shared host state.
+provision_one() {
+    local i="$1"
     NS="forkd-child-$i"
     TAP="forkd-tap0"
     VETH_H="forkd-v-${i}h"   # host side
@@ -120,8 +130,12 @@ for i in $(seq 1 "$N"); do
         ip netns exec "$NS" iptables -t nat -A POSTROUTING -s 10.42.0.0/24 -o "$VETH_C" -j SNAT --to-source "$CHILD_IP"
     fi
 
-    printf "  %s ready (tap=%s, veth=%s ↔ %s, child=%s)\n" "$NS" "$TAP" "$VETH_C" "$VETH_H" "$CHILD_IP"
-done
+    printf "  %s ready (tap=%s, veth=%s â %s, child=%s)\n" "$NS" "$TAP" "$VETH_C" "$VETH_H" "$CHILD_IP"
+}
+export -f provision_one
+export USER_OWNS HOST_IP BRIDGE BRIDGE_IP
+
+seq 1 "$N" | xargs -P "$NETNS_SETUP_PARALLELISM" -I{} bash -c 'provision_one "$@"' _ {}
 
 say "done."
 echo

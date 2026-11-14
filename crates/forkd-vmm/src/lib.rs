@@ -714,6 +714,14 @@ pub struct ForkOpts {
     /// source sandbox holds `forkd-child-1`, grandchildren start higher).
     /// Index zero is never assigned — the first index is always
     /// `netns_offset + 1`.
+    ///
+    /// Daemon-path spawns instead carry the EXACT reserved indices in
+    /// `netns_indices` (one per child, 1-based on the wire): the allocator
+    /// hands out any free indices, not a contiguous range (prod lax
+    /// 2026-11-14: a contiguous-range scan 503'd n=100 with 89 indices
+    /// free once live children fragmented the pool). Empty falls back to
+    /// the legacy `netns_offset + child_index` naming (CLI cold-boot path).
+    pub netns_indices: Vec<usize>,
     pub netns_offset: usize,
     /// If Some, immediately after restore each child is pre-warmed by
     /// taking a throwaway snapshot into this scratch directory. This
@@ -784,6 +792,7 @@ impl Default for ForkOpts {
             per_child_netns: false,
             memory_limit_mib: None,
             quota: cgroup::ChildQuota::default(),
+            netns_indices: Vec::new(),
             netns_offset: 0,
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
@@ -1331,8 +1340,14 @@ fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>)
                 }
             };
 
-            sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT)
-                .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
+            sync_one_child_clock(
+                ping,
+                now,
+                set_clock,
+                CLOCK_SYNC_AGENT_TIMEOUT,
+                CLOCK_SYNC_AGENT_GRACE,
+            )
+            .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
         }));
     }
 
@@ -1429,21 +1444,59 @@ fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>)
 /// - `timeout` — maximum time to wait for `ping` to succeed. Injected
 ///   so the timeout path can be unit-tested without waiting the full
 ///   10-second production budget.
+/// - `grace` — connection-refused fast-fail window. A snapshot-restored
+///   guest resumes with ALL of its userspace processes already running:
+///   an image that ships `forkd-agent.py` is bound to port 8888 within
+///   milliseconds of the vCPUs resuming (the listener survived the
+///   snapshot). So if every probe so far failed with ECONNREFUSED and
+///   the grace has expired, the agent is NOT in the image and polling
+///   to the full timeout would only add dead latency to every spawn
+///   (prod lax 2026-11-14: every daemon-path fork burned the full 10s
+///   budget against an agent-less base snapshot). Any non-refused
+///   error (timeout / unreachable) cancels the fast-fail — the netns
+///   or route may still be attaching — and the full `timeout` budget
+///   applies again.
 fn sync_one_child_clock(
     mut ping: impl FnMut() -> Result<()>,
     now: impl Fn() -> u64,
     set_clock: impl FnOnce(u64) -> Result<()>,
     timeout: Duration,
+    grace: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let grace_deadline = Instant::now() + grace;
+    let mut all_refused = true;
     loop {
-        if ping().is_ok() {
-            break;
+        match ping() {
+            Ok(_) => break,
+            Err(e) => {
+                let refused = is_connection_refused(&e);
+                if !refused {
+                    all_refused = false;
+                }
+                // Pure refusals for the whole grace = the image ships no
+                // agent: bail fast instead of polling to the timeout.
+                if refused && all_refused && Instant::now() >= grace_deadline {
+                    bail!(
+                        "guest agent is not listening (connection refused for the whole {:?} grace) — the image ships no forkd-agent.py; skipping clock sync (best-effort)",
+                        grace
+                    );
+                }
+                // Every path honors the overall budget — once a
+                // non-refused error cancels the streak, later refusals
+                // must still end at the timeout, never loop forever.
+                if Instant::now() >= deadline {
+                    bail!("did not respond within {}s", timeout.as_secs());
+                }
+                // Fast cadence while the absent-agent streak is live;
+                // the original 200 ms cadence otherwise.
+                thread::sleep(Duration::from_millis(if refused && all_refused {
+                    25
+                } else {
+                    200
+                }));
+            }
         }
-        if Instant::now() >= deadline {
-            bail!("did not respond within {}s", timeout.as_secs());
-        }
-        thread::sleep(Duration::from_millis(200));
     }
 
     // Capture the host timestamp AFTER the agent is confirmed alive,
@@ -1457,6 +1510,23 @@ fn sync_one_child_clock(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Connection-refused grace for the daemon-path clock sync (see
+/// `sync_one_child_clock`). 500 ms covers veth/tap attach jitter after
+/// resume; a warm snapshot either has the agent listening (answers in
+/// ms) or does not (refused forever) — nothing in between.
+const CLOCK_SYNC_AGENT_GRACE: Duration = Duration::from_millis(500);
+
+/// True when the error chain bottoms out in `ECONNREFUSED` — the guest
+/// TCP stack answered with RST, which after a snapshot restore means
+/// the image has no listener on the agent port.
+fn is_connection_refused(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+    })
+}
 
 /// Default per-call timeout. Most Firecracker API calls return in <1 ms.
 const DEFAULT_API_TIMEOUT_SECS: u64 = 10;
@@ -2482,6 +2552,7 @@ impl Snapshot {
                 per_child_netns: false,
                 memory_limit_mib: None,
                 quota: cgroup::ChildQuota::default(),
+                netns_indices: Vec::new(),
                 netns_offset: 0,
                 prewarm_scratch_dir: None,
                 memory_backend: MemoryBackend::File,
@@ -2539,7 +2610,11 @@ impl Snapshot {
             // Per-child files use the within-batch index (1..=n) so work_dir
             // layout is predictable. Netns / cgroup index applies the offset
             // so multiple batches can coexist on one host (branching case).
-            let global_idx = opts.netns_offset + i;
+            let global_idx = opts
+                .netns_indices
+                .get(i - 1)
+                .copied()
+                .unwrap_or(opts.netns_offset + i);
             let sock = work_dir.join(format!("child-{i}.sock"));
             let console = work_dir.join(format!("child-{i}.console"));
             // If per-child netns mode, look for forkd-child-<global_idx>
@@ -2659,7 +2734,10 @@ impl Snapshot {
                 // Cgroup leaf name tracks the global netns index so per-child
                 // resource limits don't collide with siblings created by other
                 // batches on the same host.
-                let name = format!("child-{}", opts.netns_offset + i + 1);
+                let name = match opts.netns_indices.get(i - 1) {
+                    Some(&idx) => format!("child-{idx}"),
+                    None => format!("child-{}", opts.netns_offset + i + 1),
+                };
                 match cgroup::place_child(&name, child.pid, bytes, opts.quota.clone()) {
                     Ok(path) => {
                         tracing::debug!(name=%name, pid=child.pid, mib, "cgroup placed");
@@ -4263,6 +4341,7 @@ mod tests {
             per_child_netns: false,
             memory_limit_mib: None,
             quota: cgroup::ChildQuota::default(),
+            netns_indices: Vec::new(),
             netns_offset: 0,
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
@@ -4745,8 +4824,14 @@ mod tests {
         };
 
         let poll_start = Instant::now();
-        sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT)
-            .expect("sync_one_child_clock should succeed once the probe is ready");
+        sync_one_child_clock(
+            ping,
+            now,
+            set_clock,
+            CLOCK_SYNC_AGENT_TIMEOUT,
+            CLOCK_SYNC_AGENT_GRACE,
+        )
+        .expect("sync_one_child_clock should succeed once the probe is ready");
         let poll_elapsed = poll_start.elapsed();
 
         // (1) The induced poll delay must exceed the accepted drift — this is
@@ -4853,7 +4938,7 @@ mod tests {
         // Inject a short timeout so the test doesn't wait 10s.
         let timeout = Duration::from_millis(500);
         let start = Instant::now();
-        let result = sync_one_child_clock(ping, now, set_clock, timeout);
+        let result = sync_one_child_clock(ping, now, set_clock, timeout, CLOCK_SYNC_AGENT_GRACE);
         let elapsed = start.elapsed();
 
         // The call must error with a timeout message.
@@ -4923,7 +5008,13 @@ mod tests {
         // Clock-setter always fails.
         let set_clock = |_ts: u64| bail!("date -s exited with 1: operation not permitted");
 
-        let result = sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT);
+        let result = sync_one_child_clock(
+            ping,
+            now,
+            set_clock,
+            CLOCK_SYNC_AGENT_TIMEOUT,
+            CLOCK_SYNC_AGENT_GRACE,
+        );
 
         let err = result.expect_err("expected set_clock failure to propagate");
         let msg = format!("{err:#}");
@@ -4936,6 +5027,104 @@ mod tests {
         assert!(
             now_called.load(Ordering::SeqCst),
             "now() must be called before set_clock, even when set_clock fails"
+        );
+    }
+
+    /// Prod lax 2026-11-14 receipt: the urun base snapshot ships envd but
+    /// NOT forkd-agent.py, so every daemon-path fork burned the full 10s
+    /// CLOCK_SYNC_AGENT_TIMEOUT on a probe that could never succeed
+    /// (journal: "guest clock sync failed ... did not respond within
+    /// 10s"). A snapshot-restored guest resumes with all of its
+    /// userspace already running, so pure ECONNREFUSED for the grace
+    /// window means the image has no agent — the probe must give up
+    /// fast instead of adding 10s to every spawn.
+    #[test]
+    fn sync_one_child_clock_fast_fails_when_agent_absent_from_image() {
+        let start = Instant::now();
+        let now = || 1_700_000_000;
+        let set_clock = |_ts: u64| panic!("clock must not be set when the agent is absent");
+
+        // Probe that fails exactly like ping_at() against a guest with
+        // no listener: TCP connect refused, wrapped the same way the
+        // anyhow context chain carries it.
+        let ping = || -> Result<()> {
+            Err(
+                anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                    .context("connect 10.42.0.2:8888"),
+            )
+        };
+
+        let result = sync_one_child_clock(
+            ping,
+            now,
+            set_clock,
+            CLOCK_SYNC_AGENT_TIMEOUT,
+            Duration::from_millis(100),
+        );
+
+        let err = result.expect_err("expected the absent-agent fast fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("skipping clock sync"),
+            "error should name the absent-agent skip, got: {msg}"
+        );
+        // Well under the 10s production budget; the grace was 100ms.
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "refused-only probe must fast-fail after the grace, not poll to the timeout"
+        );
+    }
+
+    /// A refused probe that is FOLLOWED by a non-refused error (or vice
+    /// versa) must NOT fast-fail: the all-refused streak is the
+    /// agent-absent signature, and any other error cancels it (the
+    /// netns or route may still be attaching) — the full timeout budget
+    /// applies again.
+    #[test]
+    fn sync_one_child_clock_refused_streak_cancelled_by_other_error() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_cl = calls.clone();
+        let now = || 1_700_000_000;
+        let set_clock = |_ts: u64| Ok(());
+        let ping = move || -> Result<()> {
+            let n = calls_cl.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // A timeout-shaped error FIRST (route not attached yet):
+                // it permanently cancels the all-refused streak, so the
+                // refusals that follow can never trigger the fast-fail —
+                // deterministic regardless of runner speed (an earlier
+                // refused-first ordering raced the 100 ms grace on a
+                // loaded CI runner).
+                Err(anyhow::anyhow!("agent not ready"))
+            } else {
+                Err(anyhow::Error::from(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                ))
+                .context("connect 10.42.0.2:8888"))
+            }
+        };
+
+        // Tiny timeout so the test is fast; the streak must cancel and
+        // the call end with the ordinary timeout message.
+        let result = sync_one_child_clock(
+            ping,
+            now,
+            set_clock,
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+        );
+        let err = result.expect_err("expected the ordinary timeout");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not respond within"),
+            "a cancelled streak must fall back to the timeout, got: {msg}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "polling must continue past the cancelled streak into the refusals"
         );
     }
 

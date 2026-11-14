@@ -32,15 +32,19 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
-/// RAII lease on a range of `forkd-child-N` indices.
+/// RAII lease on a set of `forkd-child-N` indices (1-based on the wire:
+/// `forkd-child-1` …).
 ///
-/// Indices are 1-based on the wire (`forkd-child-1` …); `offset` is the
-/// additive offset applied before the within-batch `1..=n` loop, so the
-/// lease covers `offset+1 ..= offset+n`.
+/// Prod lax 2026-11-14: with 100 netns provisioned and live children at
+/// indices 1..11, a `n=100` spawn answered an instant 503 while `n=87`
+/// succeeded — the old lease carried ONE contiguous range
+/// `[offset+1 .. offset+n]`, so mid-pool live children fragmented the
+/// pool below the free count. The lease is now a SET of the `n` lowest
+/// free indices; callers name each child from its own index
+/// (`NetnsReservation::indices`).
 #[derive(Debug)]
 pub struct NetnsReservation {
-    offset: usize,
-    n: usize,
+    indices: Vec<usize>,
     /// Set on `commit`; while false the indices stay in the allocator's
     /// reserved set and are released on drop.
     committed: bool,
@@ -50,8 +54,8 @@ pub struct NetnsReservation {
 }
 
 impl NetnsReservation {
-    pub fn offset(&self) -> usize {
-        self.offset
+    pub fn indices(&self) -> &[usize] {
+        &self.indices
     }
 
     /// Transfer the reservation from "in-flight" to "owned by live VMs":
@@ -62,7 +66,8 @@ impl NetnsReservation {
     pub fn commit(&mut self) {
         if !self.committed {
             self.committed = true;
-            self.alloc.commit_range(self.offset, self.n);
+            let indices = self.indices.clone();
+            self.alloc.commit_indices(&indices);
         }
     }
 }
@@ -70,7 +75,8 @@ impl NetnsReservation {
 impl Drop for NetnsReservation {
     fn drop(&mut self) {
         if !self.committed {
-            self.alloc.release_reserved(self.offset, self.n);
+            let indices = self.indices.clone();
+            self.alloc.release_reserved_indices(&indices);
         }
     }
 }
@@ -182,61 +188,53 @@ impl NetnsAllocator {
         self.provisioned
     }
 
-    /// Reserve `n` contiguous child indices. Returns `None` when the
-    /// provisioned pool cannot satisfy the request.
+    /// Reserve the `n` lowest free child indices — ANY free indices, not
+    /// a contiguous range. Fragmented pools (live children scattered
+    /// through the pool) must never fail a request with free >= n: prod
+    /// lax answered an instant 503 for n=100 with 89 indices free.
     ///
     /// The returned lease is held until `commit` or drop; concurrent
     /// reservations are disjoint because the check-then-act happens
     /// under the allocator's lock. Committed (live) indices are also
-    /// skipped, so a still-running VM's range is never handed out again.
+    /// skipped, so a still-running VM's index is never handed out again.
     pub fn reserve(self: &Arc<Self>, n: usize) -> Option<NetnsReservation> {
         if n == 0 {
             return None;
         }
         let mut reserved = self.reserved.lock();
         let active = self.active.lock();
-        // Search offsets 0..=provisioned-n so that offset+n <= provisioned.
-        let max_offset = self.provisioned.saturating_sub(n);
-        for offset in 0..=max_offset {
-            let range_start = offset + 1;
-            let range_end = offset + n + 1; // exclusive
-            let mut ok = true;
-            for i in range_start..range_end {
-                if reserved.contains(&i) || active.contains(&i) || !self.probe.exists(i) {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                for i in range_start..range_end {
-                    reserved.insert(i);
-                }
-                return Some(NetnsReservation {
-                    offset,
-                    n,
-                    committed: false,
-                    alloc: Arc::clone(self),
-                });
-            }
+        let mut free: Vec<usize> = (1..=self.provisioned)
+            .filter(|&i| !reserved.contains(&i) && !active.contains(&i) && self.probe.exists(i))
+            .collect();
+        if free.len() < n {
+            return None;
         }
-        None
+        free.truncate(n);
+        for &i in &free {
+            reserved.insert(i);
+        }
+        Some(NetnsReservation {
+            indices: free,
+            committed: false,
+            alloc: Arc::clone(self),
+        })
     }
 
-    /// Move a reserved range into the active (live) set. Called by
+    /// Move reserved indices into the active (live) set. Called by
     /// `NetnsReservation::commit` once the VMs are registered.
-    fn commit_range(&self, offset: usize, n: usize) {
+    fn commit_indices(&self, indices: &[usize]) {
         let mut reserved = self.reserved.lock();
         let mut active = self.active.lock();
-        for i in (offset + 1)..(offset + n + 1) {
+        for &i in indices {
             reserved.remove(&i);
             active.insert(i);
         }
     }
 
     /// Remove indices from the reserved set (rollback on spawn failure).
-    fn release_reserved(&self, offset: usize, n: usize) {
+    fn release_reserved_indices(&self, indices: &[usize]) {
         let mut reserved = self.reserved.lock();
-        for i in (offset + 1)..(offset + n + 1) {
+        for &i in indices {
             reserved.remove(&i);
         }
     }
@@ -269,16 +267,16 @@ mod tests {
     fn reserves_disjoint_ranges() {
         let a = alloc(16);
         let mut r1 = a.reserve(2).expect("r1");
-        assert_eq!(r1.offset(), 0); // covers 1,2
+        assert_eq!(r1.indices(), &[1, 2]);
         let r2 = a.reserve(1).expect("r2");
-        assert_eq!(r2.offset(), 2); // covers 3
-                                    // commit r1 — indices 1,2 become ACTIVE (owned by live VMs), not
-                                    // free: a committed range must not be reused while its VMs live.
+        assert_eq!(r2.indices(), &[3]);
+        // commit r1 — indices 1,2 become ACTIVE (owned by live VMs), not
+        // free: a committed range must not be reused while its VMs live.
         r1.commit();
         let r3 = a.reserve(1).expect("r3");
-        assert_eq!(r3.offset(), 3); // covers 4 (1,2 active; 3 reserved)
+        assert_eq!(r3.indices(), &[4]); // 1,2 active; 3 reserved
         let r4 = a.reserve(5).expect("r4");
-        assert_eq!(r4.offset(), 4); // covers 5..9
+        assert_eq!(r4.indices(), &[5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -287,13 +285,14 @@ mod tests {
         let mut r1 = a.reserve(2).expect("r1"); // covers 1,2
         r1.commit();
         // While active, the range is NOT reusable.
-        assert!(a.reserve(1).is_some()); // offset 2 covers 3
-        assert_eq!(a.reserve(2).expect("r2").offset(), 2); // covers 3,4
-                                                           // Release index 1 only (VM 1 deleted, VM 2 still live).
+        let held = a.reserve(1).expect("takes the lowest free index");
+        assert_eq!(held.indices(), &[3]);
+        assert_eq!(a.reserve(2).expect("r2").indices(), &[4, 5]);
+        // Release index 1 only (VM 1 deleted, VM 2 still live).
         a.release_index(1);
         let r = a.reserve(1).expect("r3");
-        assert_eq!(r.offset(), 0); // covers 1 — index 1 free, index 2 active
-                                   // Releasing an already-free index is a no-op.
+        assert_eq!(r.indices(), &[1]); // index 1 free, index 2 active
+                                       // Releasing an already-free index is a no-op.
         a.release_index(1);
         a.release_index(99);
     }
@@ -304,7 +303,7 @@ mod tests {
         let r1 = a.reserve(3).expect("r1"); // covers 1..3
         drop(r1);
         let r2 = a.reserve(3).expect("r2");
-        assert_eq!(r2.offset(), 0); // same range reusable
+        assert_eq!(r2.indices(), &[1, 2, 3]); // same indices reusable
     }
 
     #[test]
@@ -325,23 +324,25 @@ mod tests {
                     // All threads reserve before any reports back, so
                     // the reservations overlap in time.
                     barrier.wait();
-                    let o = r.offset();
-                    (o, o + 4)
+                    let mut idx = r.indices().to_vec();
+                    idx.sort();
+                    idx
                 })
             })
             .collect();
         barrier.wait(); // main joins the reservation window
-        let mut ranges: Vec<(usize, usize)> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
-        ranges.sort();
-        for pair in ranges.windows(2) {
-            assert!(
-                pair[0].1 <= pair[1].0,
-                "ranges overlap: {:?} vs {:?}",
-                pair[0],
-                pair[1]
-            );
-        }
+        let mut all_indices: Vec<usize> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all_indices.sort();
+        assert_eq!(
+            all_indices.len(),
+            128,
+            "index sets overlap: {all_indices:?}"
+        );
+        let unique: std::collections::HashSet<usize> = all_indices.iter().copied().collect();
+        assert_eq!(unique.len(), 128);
     }
 
     #[test]
@@ -374,11 +375,15 @@ mod tests {
         std::fs::write(dir.path().join("forkd-child-3"), b"").unwrap();
         let a = NetnsAllocator::discover(dir.path());
         assert_eq!(a.provisioned(), 3);
-        // Only provisioned indices are usable: offset 0 (covers 1) works,
-        // offset 1 (covers 2, which is not provisioned) does not.
-        assert!(a.reserve(1).is_some());
-        drop(a.reserve(1));
-        assert!(a.reserve(2).is_none(), "index 2 is not provisioned");
+        // Only provisioned indices are usable: any-free allocation skips
+        // the unprovisioned index 2 instead of failing the batch (the old
+        // contiguous scan refused n=2 with 2 free indices flanking it).
+        let held = a.reserve(1).expect("takes provisioned index 1");
+        assert_eq!(held.indices(), &[1]);
+        drop(held); // rollback: index 1 free again — only 2 provisioned exist
+        let r = a.reserve(2).expect("skips unprovisioned index 2");
+        assert_eq!(r.indices(), &[1, 3]);
+        assert!(a.reserve(3).is_none(), "only 2 provisioned indices exist");
     }
 
     #[test]
@@ -398,7 +403,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let r = a.reserve(1).expect("reserve in pool");
                     barrier.wait();
-                    r.offset() + 1 // the actual index
+                    r.indices()[0] // the actual index
                 })
             })
             .collect();
@@ -420,6 +425,45 @@ mod tests {
         for idx in 1..=4 {
             a.release_index(idx);
         }
-        assert_eq!(a.reserve(1).unwrap().offset(), 0);
+        assert_eq!(a.reserve(1).unwrap().indices(), &[1]);
+    }
+
+    /// Prod lax 2026-11-14 receipt: with 100 netns provisioned and live
+    /// children at forkd-child-1..11, `POST /v1/sandboxes n=100` answered
+    /// an instant 503 "netns pool exhausted" while `n=87` returned 201 —
+    /// free >= n but no single contiguous free run of n. `reserve` MUST
+    /// allocate any free indices (lowest first) so mid-pool fragmentation
+    /// never fails a satisfiable request.
+    #[test]
+    fn reserve_fills_around_active_fragmentation() {
+        let a = alloc(10);
+        let mut c1 = a.reserve(3).expect("c1"); // 1,2,3
+        c1.commit();
+        let mut c2 = a.reserve(3).expect("c2"); // 4,5,6
+        c2.commit();
+        let mut c3 = a.reserve(4).expect("c3"); // 7..10
+        c3.commit();
+        // Pool fully committed. Live children then deleted: 1,2 and 4,6
+        // free again — free = {1,2,4,6}, largest contiguous run 2.
+        a.release_index(1);
+        a.release_index(2);
+        a.release_index(4);
+        a.release_index(6);
+        // n=3 with 4 free: the old contiguous-only scan has no run of 3
+        // and returned None — the new lowest-first fill takes 1,2,4.
+        let mut r = a
+            .reserve(3)
+            .expect("fragmentation must not fail a satisfiable request");
+        assert_eq!(r.indices(), &[1, 2, 4]);
+        r.commit();
+        // Committed indices are ACTIVE (live VMs): only 5,6 remain free,
+        // and a committed index is never handed out while its VM lives.
+        let r2 = a.reserve(1).expect("r2");
+        assert_eq!(r2.indices(), &[6]);
+        drop(r2); // rollback: the lease is dropped uncommitted, 6 is free again
+                  // The index-5 hole was never free (the live child owns it) — but no
+                  // fragmentation was created by us either: 6 answers the next batch.
+        let r3 = a.reserve(1).expect("r3");
+        assert_eq!(r3.indices(), &[6]);
     }
 }

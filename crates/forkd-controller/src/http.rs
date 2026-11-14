@@ -1340,12 +1340,17 @@ async fn create_sandbox(
         } else {
             None
         };
-        let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
+        let netns_indices: Vec<usize> = netns_reservation
+            .as_ref()
+            .map(|r| r.indices().to_vec())
+            .unwrap_or_default();
+        let netns_offset = netns_indices.first().map(|f| f - 1).unwrap_or(0);
         let opts = forkd_vmm::ForkOpts {
             n: spawn_n,
             per_child_netns: spawn_per_child_netns,
             memory_limit_mib: spawn_mem_limit,
             quota: spawn_quota,
+            netns_indices: netns_indices.clone(),
             netns_offset,
             prewarm_scratch_dir,
             // Phase 6 unstable: live_fork=true opts the sandbox into
@@ -3015,7 +3020,11 @@ fn spawn_one_for_workspace(
     } else {
         None
     };
-    let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
+    let netns_indices: Vec<usize> = netns_reservation
+        .as_ref()
+        .map(|r| r.indices().to_vec())
+        .unwrap_or_default();
+    let netns_offset = netns_indices.first().map(|f| f - 1).unwrap_or(0);
     // Generate the sandbox id early so it can serve as the shared-tap
     // owner token (release_shared_tap_if_owner checks against this id).
     let sandbox_id = new_sandbox_id();
@@ -3037,6 +3046,7 @@ fn spawn_one_for_workspace(
         per_child_netns,
         memory_limit_mib,
         quota,
+        netns_indices: netns_indices.clone(),
         netns_offset,
         prewarm_scratch_dir: None,
         memory_backend: forkd_vmm::MemoryBackend::File,

@@ -1294,8 +1294,14 @@ fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>)
                 }
             };
 
-            sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT, CLOCK_SYNC_AGENT_GRACE)
-                .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
+            sync_one_child_clock(
+                ping,
+                now,
+                set_clock,
+                CLOCK_SYNC_AGENT_TIMEOUT,
+                CLOCK_SYNC_AGENT_GRACE,
+            )
+            .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
         }));
     }
 
@@ -4157,8 +4163,14 @@ mod tests {
         };
 
         let poll_start = Instant::now();
-        sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT, CLOCK_SYNC_AGENT_GRACE)
-            .expect("sync_one_child_clock should succeed once the probe is ready");
+        sync_one_child_clock(
+            ping,
+            now,
+            set_clock,
+            CLOCK_SYNC_AGENT_TIMEOUT,
+            CLOCK_SYNC_AGENT_GRACE,
+        )
+        .expect("sync_one_child_clock should succeed once the probe is ready");
         let poll_elapsed = poll_start.elapsed();
 
         // (1) The induced poll delay must exceed the accepted drift — this is
@@ -4335,7 +4347,13 @@ mod tests {
         // Clock-setter always fails.
         let set_clock = |_ts: u64| bail!("date -s exited with 1: operation not permitted");
 
-        let result = sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT, CLOCK_SYNC_AGENT_GRACE);
+        let result = sync_one_child_clock(
+            ping,
+            now,
+            set_clock,
+            CLOCK_SYNC_AGENT_TIMEOUT,
+            CLOCK_SYNC_AGENT_GRACE,
+        );
 
         let err = result.expect_err("expected set_clock failure to propagate");
         let msg = format!("{err:#}");
@@ -4369,10 +4387,10 @@ mod tests {
         // no listener: TCP connect refused, wrapped the same way the
         // anyhow context chain carries it.
         let ping = || -> Result<()> {
-            Err(anyhow::Error::from(std::io::Error::from(
-                std::io::ErrorKind::ConnectionRefused,
-            ))
-            .context("connect 10.42.0.2:8888"))
+            Err(
+                anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                    .context("connect 10.42.0.2:8888"),
+            )
         };
 
         let result = sync_one_child_clock(

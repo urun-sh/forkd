@@ -102,6 +102,12 @@ for i in $(seq 1 "$N"); do
         ip link add "$VETH_H" type veth peer name "$VETH_C"
         ip link set "$VETH_C" netns "$NS"
     fi
+    # systemd-udev MACAddressPolicy=persistent hashes the interface NAME,
+    # and every child peer shares the name "veth0" -> one identical MAC on
+    # all children -> bridge FDB flaps -> ~50% of bridge->guest return
+    # traffic lands in the wrong netns. Pin a unique locally-administered
+    # MAC per child (idempotent; re-running repairs existing nodes).
+    ip netns exec "$NS" ip link set dev "$VETH_C" address "$(printf '02:43:00:00:%02x:%02x' $((i / 256)) $((i % 256)))"
     # host side
     ip link set "$VETH_H" master "$BRIDGE"
     ip link set "$VETH_H" up

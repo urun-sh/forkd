@@ -1470,24 +1470,31 @@ fn sync_one_child_clock(
         match ping() {
             Ok(_) => break,
             Err(e) => {
-                if is_connection_refused(&e) {
-                    // Keep polling on a fast cadence while the grace is
-                    // live; bail the moment it expires with nothing but
-                    // refusals on record.
-                    if Instant::now() >= grace_deadline && all_refused {
-                        bail!(
-                            "guest agent is not listening (connection refused for the whole {:?} grace) — the image ships no forkd-agent.py; skipping clock sync (best-effort)",
-                            grace
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                } else {
+                let refused = is_connection_refused(&e);
+                if !refused {
                     all_refused = false;
-                    if Instant::now() >= deadline {
-                        bail!("did not respond within {}s", timeout.as_secs());
-                    }
-                    thread::sleep(Duration::from_millis(200));
                 }
+                // Pure refusals for the whole grace = the image ships no
+                // agent: bail fast instead of polling to the timeout.
+                if refused && all_refused && Instant::now() >= grace_deadline {
+                    bail!(
+                        "guest agent is not listening (connection refused for the whole {:?} grace) — the image ships no forkd-agent.py; skipping clock sync (best-effort)",
+                        grace
+                    );
+                }
+                // Every path honors the overall budget — once a
+                // non-refused error cancels the streak, later refusals
+                // must still end at the timeout, never loop forever.
+                if Instant::now() >= deadline {
+                    bail!("did not respond within {}s", timeout.as_secs());
+                }
+                // Fast cadence while the absent-agent streak is live;
+                // the original 200 ms cadence otherwise.
+                thread::sleep(Duration::from_millis(if refused && all_refused {
+                    25
+                } else {
+                    200
+                }));
             }
         }
     }
@@ -5084,15 +5091,19 @@ mod tests {
         let set_clock = |_ts: u64| Ok(());
         let ping = move || -> Result<()> {
             let n = calls_cl.fetch_add(1, Ordering::SeqCst);
-            if n < 5 {
-                // Refused first (agent seemingly absent...), then a
-                // timeout-shaped error (route not attached yet).
+            if n == 0 {
+                // A timeout-shaped error FIRST (route not attached yet):
+                // it permanently cancels the all-refused streak, so the
+                // refusals that follow can never trigger the fast-fail —
+                // deterministic regardless of runner speed (an earlier
+                // refused-first ordering raced the 100 ms grace on a
+                // loaded CI runner).
+                Err(anyhow::anyhow!("agent not ready"))
+            } else {
                 Err(anyhow::Error::from(std::io::Error::from(
                     std::io::ErrorKind::ConnectionRefused,
                 ))
                 .context("connect 10.42.0.2:8888"))
-            } else {
-                Err(anyhow::anyhow!("agent not ready"))
             }
         };
 
@@ -5112,8 +5123,8 @@ mod tests {
             "a cancelled streak must fall back to the timeout, got: {msg}"
         );
         assert!(
-            calls.load(Ordering::SeqCst) > 5,
-            "polling must continue past the refused streak"
+            calls.load(Ordering::SeqCst) >= 2,
+            "polling must continue past the cancelled streak into the refusals"
         );
     }
 

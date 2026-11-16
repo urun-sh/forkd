@@ -85,19 +85,30 @@ pub trait NetnsProbe: Send + Sync {
 
 /// A probe that checks the real netns directory.
 ///
-/// Caches the provisioned index set at construction time so `reserve()`
-/// does not do a filesystem stat per candidate index while holding the
-/// allocator locks. The provisioned pool is static until `netns-setup.sh`
-/// runs and the daemon restarts (review #282).
+/// Caches the provisioned index set so `reserve()` does not do a
+/// filesystem stat per candidate index while holding the allocator locks
+/// (review #282). The cache is no longer static: a MISS triggers one
+/// directory rescan before re-checking, so namespaces provisioned after
+/// daemon construction (a background pool build, a lazy top-up) become
+/// visible without a daemon restart.
 pub struct DiskNetnsProbe {
-    provisioned: HashSet<usize>,
+    netns_dir: std::path::PathBuf,
+    provisioned: std::sync::Mutex<HashSet<usize>>,
 }
 
 impl DiskNetnsProbe {
     pub fn new(netns_dir: impl Into<std::path::PathBuf>) -> Self {
         let netns_dir = netns_dir.into();
+        let provisioned = std::sync::Mutex::new(Self::scan(&netns_dir));
+        Self {
+            netns_dir,
+            provisioned,
+        }
+    }
+
+    fn scan(netns_dir: &std::path::Path) -> HashSet<usize> {
         let mut provisioned = HashSet::new();
-        if let Ok(rd) = std::fs::read_dir(&netns_dir) {
+        if let Ok(rd) = std::fs::read_dir(netns_dir) {
             for entry in rd.flatten() {
                 if let Some(s) = entry.file_name().to_str() {
                     if let Some(idx) = s.strip_prefix("forkd-child-") {
@@ -108,13 +119,25 @@ impl DiskNetnsProbe {
                 }
             }
         }
-        Self { provisioned }
+        provisioned
     }
 }
 
 impl NetnsProbe for DiskNetnsProbe {
     fn exists(&self, index: usize) -> bool {
-        self.provisioned.contains(&index)
+        {
+            let set = self.provisioned.lock().expect("netns probe cache");
+            if set.contains(&index) {
+                return true;
+            }
+        }
+        // Miss: the pool may have grown since construction (background
+        // provisioning after node registration). Rescan ONCE per miss and
+        // re-check — the fast path stays a cached membership test.
+        let fresh = Self::scan(&self.netns_dir);
+        let mut set = self.provisioned.lock().expect("netns probe cache");
+        *set = fresh;
+        set.contains(&index)
     }
 }
 
@@ -169,11 +192,16 @@ impl NetnsAllocator {
     /// Discover the provisioned pool by scanning the netns directory
     /// (max existing `forkd-child-N` index). The probe caches the full
     /// provisioned index set at construction time so `reserve()` avoids
-    /// per-index filesystem stats (review #282).
+    /// per-index filesystem stats (review #282); a later miss rescans, so
+    /// a pool that grows after construction stays visible.
     pub fn discover(netns_dir: impl Into<std::path::PathBuf>) -> Arc<Self> {
         let netns_dir = netns_dir.into();
+        let max = DiskNetnsProbe::scan(&netns_dir)
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
         let probe = DiskNetnsProbe::new(&netns_dir);
-        let max = probe.provisioned.iter().copied().max().unwrap_or(0);
         Self::new(max, Box::new(probe))
     }
 
@@ -253,6 +281,30 @@ impl NetnsAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_probe_sees_pools_that_grow_after_construction() {
+        // The background pool build (the skc render) creates forkd-child-N
+        // files AFTER the daemon constructed its probe. A cached miss must
+        // rescan the netns dir so the growing pool is visible to reserve()
+        // without a daemon restart — otherwise a boot that defers the pool
+        // off the critical path leaves the daemon serving an empty pool
+        // forever.
+        let dir = std::env::temp_dir().join(format!("forkd-probe-grow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("netns tmpdir");
+        std::fs::write(dir.join("forkd-child-1"), b"").expect("child 1");
+        let probe = DiskNetnsProbe::new(&dir);
+        assert!(NetnsProbe::exists(&probe, 1));
+        assert!(!NetnsProbe::exists(&probe, 2));
+        // the background builder lands child-2 AFTER construction
+        std::fs::write(dir.join("forkd-child-2"), b"").expect("child 2");
+        assert!(
+            NetnsProbe::exists(&probe, 2),
+            "a probe miss must rescan the netns dir (background pool growth)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn alloc(max: usize) -> Arc<NetnsAllocator> {
         NetnsAllocator::new(max, Box::new(RangeProbe { max }))
